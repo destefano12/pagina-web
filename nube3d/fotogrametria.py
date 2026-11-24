@@ -8,6 +8,7 @@ import glob
 import io
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,12 +60,26 @@ def _run(cmd, cwd, log, avance=None):
 
 
 # calidad: tamaño de foto que usa la nube y nivel de detalle de la nube densa (0 = máximo)
-TAM = int(os.environ.get('CALIDAD_TAM', '3200'))
+TAM = int(os.environ.get('CALIDAD_TAM', '4096'))
 NIVEL = int(os.environ.get('CALIDAD_NIVEL', '1'))
 
 
-def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colmap_dir=None, mvs_dir=None, hilos=0, gpu=False, modo='plato'):
-    """Devuelve la ruta del .glb final. modo: 'plato' (menú), 'objeto' o 'ambiente' (Metra 3D).
+def _resumen(colmap, modelo, log):
+    """Cuántas fotos quedaron ubicadas y cuántos puntos tiene la reconstrucción inicial."""
+    try:
+        out = subprocess.run([colmap, 'model_analyzer', '--path', modelo], capture_output=True, text=True, timeout=120)
+        txt = out.stdout + out.stderr
+        log.write(txt[-2000:]); log.flush()
+        reg = re.search(r'Registered images:\s*(\d+)', txt)
+        pts = re.search(r'Points:\s*(\d+)', txt)
+        return (int(reg.group(1)) if reg else 0), (int(pts.group(1)) if pts else 0)
+    except Exception:
+        return 0, 0
+
+
+def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colmap_dir=None, mvs_dir=None, hilos=0, gpu=False, modo='plato', cajas=None):
+    """cajas: {nombre_foto: [x0, y0, x1, y1]} en 0..1, el recuadro donde está el objeto en cada foto.
+    Devuelve la ruta del .glb final. modo: 'plato' (menú), 'objeto' o 'ambiente' (Metra 3D).
     Las medidas finales quedan en <glb>.json. ancho_cm puede ser None (sin escala real)."""
     os.makedirs(trabajo, exist_ok=True)
     colmap = _bin(colmap_dir, 'colmap') if not (colmap_dir and os.path.exists(os.path.join(colmap_dir, 'COLMAP.bat'))) else os.path.join(colmap_dir, 'COLMAP.bat')
@@ -92,6 +107,11 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     if not modelos:
         raise ErrorFoto('No se pudieron unir las fotos. Sacalas con más luz, sin moverte rápido y dando la vuelta completa.')
     mejor = max(modelos, key=lambda d: os.path.getsize(os.path.join(d, 'images.bin')) if os.path.exists(os.path.join(d, 'images.bin')) else 0)
+    # control rápido: si casi no se pudieron unir las fotos, se corta acá (no tiene sentido seguir una hora)
+    reg, pts = _resumen(colmap, mejor, log)
+    if modo != 'ambiente' and reg and (reg < max(12, len(fotos) * 0.5) or pts < 1000):
+        raise ErrorFoto(f'Solo se pudieron usar {reg} de {len(fotos)} fotos: el objeto tiene muy poco detalle o brilla mucho. '
+                        'Probá con algo con más textura (comida, madera, tela), luz pareja sin reflejos y la mesa con textura.')
 
     E = 'Preparando las fotos'; avisar(38, E)
     dense = os.path.join(trabajo, 'dense')
@@ -106,9 +126,9 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     avisar(45, 'Convirtiendo la escena')
     _run([mvs('InterfaceCOLMAP'), '-i', dense, '-o', 'escena.mvs', '--image-folder', os.path.join(dense, 'images'), '-v', '1'], trabajo, log)
     E = 'Armando la nube de puntos densa (es lo que más tarda)'; avisar(52, E)
-    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '-v', '1', *th], trabajo, log, (avisar, 52, 75, 900 * k, E))
+    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '--max-resolution', '1800', '-v', '1', *th], trabajo, log, (avisar, 52, 75, 900 * k, E))
     E = 'Creando la superficie'; avisar(75, E)
-    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '-v', '1', *th], trabajo, log, (avisar, 75, 85, 120 * k, E))
+    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '--close-holes', '300' if modo != 'ambiente' else '30', '-v', '1', *th], trabajo, log, (avisar, 75, 85, 120 * k, E))
     E = 'Pintando la textura'; avisar(85, E)
     _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', 'escena_dense_mesh.ply', '--decimate', '1',
           '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log, (avisar, 85, 94, 180 * k, E))
@@ -118,7 +138,7 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
 
     avisar(94, 'Recortando la mesa y ajustando el tamaño real' if modo != 'ambiente' else 'Enderezando el ambiente y midiendo')
     final = os.path.join(trabajo, 'modelo.glb' if modo != 'plato' else 'plato.glb')
-    dims = limpiar(crudo, final, ancho_cm, modo=modo, arriba=arriba)
+    dims = limpiar(crudo, final, ancho_cm, modo=modo, arriba=arriba, cajas=cajas, sparse_dir=os.path.join(dense, 'sparse'))
     import json as _json
     with open(final + '.json', 'w') as f:
         _json.dump(dims, f)
@@ -206,7 +226,44 @@ def _quedarse_con_el_plato(sub, n):
     return sub.submesh([caras], append=True)
 
 
-def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=None):
+def _dentro_de_cajas(v, cajas, sparse_dir, margen=0.08):
+    """Para cada punto del modelo: ¿cae dentro del recuadro del objeto en la mayoría de las fotos que lo ven?"""
+    try:
+        cams = {}
+        for l in open(os.path.join(sparse_dir, 'cameras.txt'), encoding='utf-8'):
+            if l.startswith('#') or not l.strip():
+                continue
+            p = l.split(); w, h = float(p[2]), float(p[3]); q = list(map(float, p[4:]))
+            fx, fy, cx, cy = (q[0], q[1], q[2], q[3]) if p[1] in ('PINHOLE', 'OPENCV', 'FULL_OPENCV') else (q[0], q[0], q[1], q[2])
+            cams[p[0]] = (w, h, fx, fy, cx, cy)
+        lineas = [l for l in open(os.path.join(sparse_dir, 'images.txt'), encoding='utf-8') if l.strip() and not l.startswith('#')]
+        vis = np.zeros(len(v)); den = np.zeros(len(v)); usadas = 0
+        for l in lineas[0::2]:
+            p = l.split()
+            caja = cajas.get(p[9]) or cajas.get(os.path.splitext(p[9])[0] + '.jpg')
+            if not caja or p[8] not in cams:
+                continue
+            qw, qx, qy, qz = map(float, p[1:5]); t = np.array(list(map(float, p[5:8])))
+            Rm = np.array([[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                           [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                           [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
+            w, h, fx, fy, cx, cy = cams[p[8]]
+            X = v @ Rm.T + t; z = X[:, 2]; ok = z > 1e-6
+            u = np.where(ok, fx * X[:, 0] / np.where(ok, z, 1) + cx, -1) / w
+            y = np.where(ok, fy * X[:, 1] / np.where(ok, z, 1) + cy, -1) / h
+            enfoto = ok & (u >= 0) & (u < 1) & (y >= 0) & (y < 1)
+            x0, y0, x1, y1 = caja; mx, my = (x1 - x0) * margen, (y1 - y0) * margen
+            dentro = enfoto & (u >= x0 - mx) & (u <= x1 + mx) & (y >= y0 - my) & (y <= y1 + my)
+            den += enfoto; vis += dentro; usadas += 1
+        if usadas < 8:
+            return None
+        return (den >= 3) & (vis >= 0.6 * np.maximum(den, 1))
+    except Exception as e:
+        print('aviso cajas:', e, file=sys.stderr)
+        return None
+
+
+def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=None, cajas=None, sparse_dir=None):
     scene = trimesh.load(entrada, force='scene')
     geoms = [g for g in scene.dump() if isinstance(g, trimesh.Trimesh)]
     if not geoms:
@@ -214,6 +271,14 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=No
     m = max(geoms, key=lambda g: len(g.faces)) if len(geoms) == 1 else trimesh.util.concatenate(geoms)
     if modo == 'ambiente':
         return _limpiar_ambiente(m, salida, ancho_cm, arriba, max_caras=max(max_caras, 400000))
+    # 0) si el usuario marcó el objeto en la cámara, nos quedamos solo con lo que cae dentro de su recuadro
+    if cajas and sparse_dir:
+        dentro = _dentro_de_cajas(m.vertices, cajas, sparse_dir)
+        if dentro is not None:
+            caras = np.nonzero(dentro[m.faces].all(axis=1))[0]
+            print(f'  recuadro: quedan {len(caras)} de {len(m.faces)} caras', file=sys.stderr)
+            if len(caras) > 500:
+                m = m.submesh([caras], append=True)
     v = m.vertices
     # 1) la mesa es el plano más grande: lo usamos como piso
     n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
@@ -259,7 +324,7 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=No
         if img is not None:
             img = img.convert('RGB')
             if max(img.size) > 4096: img.thumbnail((4096, 4096))
-            buf = io.BytesIO(); img.save(buf, 'JPEG', quality=86); buf.seek(0)
+            buf = io.BytesIO(); img.save(buf, 'JPEG', quality=93); buf.seek(0)
             jpg = Image.open(buf)
             if hasattr(mat, 'baseColorTexture'): mat.baseColorTexture = jpg
             else: mat.image = jpg
@@ -326,7 +391,7 @@ def _limpiar_ambiente(m, salida, ancho_cm, arriba, max_caras=400000):
         if img is not None:
             img = img.convert('RGB')
             if max(img.size) > 4096: img.thumbnail((4096, 4096))
-            buf = io.BytesIO(); img.save(buf, 'JPEG', quality=86); buf.seek(0)
+            buf = io.BytesIO(); img.save(buf, 'JPEG', quality=93); buf.seek(0)
             jpg = Image.open(buf)
             if hasattr(mat, 'baseColorTexture'): mat.baseColorTexture = jpg
             else: mat.image = jpg

@@ -87,7 +87,15 @@ def hacer(r):
         for f in r['fotos']:
             bajar(f['url'], os.path.join(fotos, f['nombre']))
         ancho = float(r['ancho_cm']) if r.get('ancho_cm') else None
-        glb = procesar(fotos, os.path.join(carpeta, 'trabajo'), ancho, avisar=avisar, mvs_dir=os.environ.get('MVS_DIR') or None, hilos=0, gpu=False, modo=modo)
+        cajas = None
+        if r.get('cajas'):  # recuadro del objeto marcado en la cámara, foto por foto
+            try:
+                with urllib.request.urlopen(r['cajas'], timeout=60) as cr:
+                    cajas = json.loads(cr.read())
+                print(f'  recuadros del objeto: {len(cajas)} fotos', flush=True)
+            except Exception as ex:
+                print('  (no pude bajar los recuadros:', ex, ')', flush=True)
+        glb = procesar(fotos, os.path.join(carpeta, 'trabajo'), ancho, avisar=avisar, mvs_dir=os.environ.get('MVS_DIR') or None, hilos=0, gpu=False, modo=modo, cajas=cajas)
         dims = {}
         if os.path.exists(glb + '.json'):
             dims = json.load(open(glb + '.json'))
