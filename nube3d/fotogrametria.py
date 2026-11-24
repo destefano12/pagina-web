@@ -40,6 +40,11 @@ def _run(cmd, cwd, log):
         raise RuntimeError(f'Falló {os.path.basename(str(cmd[0]))} (código {p.returncode}). Ver registro.log')
 
 
+# calidad: tamaño de foto que usa la nube y nivel de detalle de la nube densa (0 = máximo)
+TAM = int(os.environ.get('CALIDAD_TAM', '3200'))
+NIVEL = int(os.environ.get('CALIDAD_NIVEL', '1'))
+
+
 def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colmap_dir=None, mvs_dir=None, hilos=0, gpu=False):
     """Devuelve la ruta del .glb final."""
     os.makedirs(trabajo, exist_ok=True)
@@ -56,9 +61,11 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     avisar(8, 'Buscando puntos en las fotos')
     _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
           '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
-          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', '1600'], trabajo, log)
+          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(TAM),
+          '--SiftExtraction.max_num_features', '12000'], trabajo, log)
     avisar(18, 'Uniendo las fotos entre sí')
-    _run([colmap, 'exhaustive_matcher', '--database_path', db, '--SiftMatching.use_gpu', g], trabajo, log)
+    _run([colmap, 'exhaustive_matcher', '--database_path', db, '--SiftMatching.use_gpu', g,
+          '--SiftMatching.guided_matching', '1'], trabajo, log)
     avisar(30, 'Calculando dónde estaba la cámara')
     _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log)
     modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
@@ -69,7 +76,7 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     avisar(38, 'Preparando las fotos')
     dense = os.path.join(trabajo, 'dense')
     _run([colmap, 'image_undistorter', '--image_path', fotos_dir, '--input_path', mejor, '--output_path', dense,
-          '--output_type', 'COLMAP', '--max_image_size', '1600'], trabajo, log)
+          '--output_type', 'COLMAP', '--max_image_size', str(TAM)], trabajo, log)
     # OpenMVS espera los parámetros de cámara en texto
     sp = os.path.join(dense, 'sparse')
     _run([colmap, 'model_converter', '--input_path', sp, '--output_path', sp, '--output_type', 'TXT'], trabajo, log)
@@ -78,11 +85,11 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     avisar(45, 'Convirtiendo la escena')
     _run([mvs('InterfaceCOLMAP'), '-i', dense, '-o', 'escena.mvs', '--image-folder', os.path.join(dense, 'images'), '-v', '1'], trabajo, log)
     avisar(52, 'Armando la nube de puntos densa (es lo que más tarda)')
-    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', '1', '-v', '1', *th], trabajo, log)
+    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '-v', '1', *th], trabajo, log)
     avisar(75, 'Creando la superficie')
     _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '-v', '1', *th], trabajo, log)
     avisar(85, 'Pintando la textura')
-    _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', 'escena_dense_mesh.ply', '--decimate', '0.6',
+    _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', 'escena_dense_mesh.ply', '--decimate', '1',
           '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log)
     crudo = os.path.join(trabajo, 'escena_textura.glb')
     if not os.path.exists(crudo):
