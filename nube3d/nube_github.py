@@ -116,12 +116,20 @@ def main():
         with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
             f.write(f'hay={"si" if n else "no"}\n')
         return
+    inicio, vacio = time.time(), 0
     while True:
         r = nube('tomar', worker=NOMBRE)
-        if not r.get('trabajo'):
+        if r.get('trabajo'):
+            vacio = 0
+            hacer(r)
+            continue
+        # La cola está vacía: se espera un rato por si alguien está terminando de subir otro escaneo,
+        # así no queda esperando a la próxima vuelta.
+        vacio += 1
+        if vacio > 8 or time.time() - inicio > 120 * 60:
             print('No hay más escaneos en la cola.')
             return
-        hacer(r)
+        time.sleep(20)
 
 
 if __name__ == '__main__':
