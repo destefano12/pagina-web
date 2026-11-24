@@ -14,7 +14,6 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fotogrametria import ErrorFoto, procesar  # noqa: E402
 
 NUBE = os.environ.get('NUBE_URL', 'https://xeajsygiqueyzxemcbxl.supabase.co/functions/v1/nube')
 TRABAJOS = os.environ.get('TRABAJOS_DIR', '/tmp/trabajos')
@@ -67,6 +66,7 @@ def subir(url, ruta):
 
 
 def hacer(r):
+    from fotogrametria import ErrorFoto, procesar  # se carga solo si hay trabajo
     e = r['trabajo']; eid = e['id']
     carpeta = os.path.join(TRABAJOS, eid); fotos = os.path.join(carpeta, 'fotos'); os.makedirs(fotos, exist_ok=True)
     print(f'\n== Escaneo {eid}: {len(r["fotos"])} fotos, ancho {r["ancho_cm"]} cm', flush=True)
