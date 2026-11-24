@@ -129,8 +129,14 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '--max-resolution', '1800', '-v', '1', *th], trabajo, log, (avisar, 52, 75, 900 * k, E))
     E = 'Creando la superficie'; avisar(75, E)
     _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '--close-holes', '300' if modo != 'ambiente' else '30', '-v', '1', *th], trabajo, log, (avisar, 75, 85, 120 * k, E))
-    E = 'Pintando la textura'; avisar(85, E)
-    _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', 'escena_dense_mesh.ply', '--decimate', '1',
+    malla, plano = 'escena_dense_mesh.ply', None
+    if modo != 'ambiente':
+        avisar(84, 'Separando el objeto de la mesa y del fondo')
+        plano = _recortar_objeto(os.path.join(trabajo, 'escena_dense_mesh.ply'), os.path.join(trabajo, 'objeto.ply'), arriba, cajas, sp)
+        if plano is not None:
+            malla = 'objeto.ply'
+    E = 'Pintando la textura en 4K'; avisar(85, E)
+    _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', malla, '--decimate', '1',
           '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log, (avisar, 85, 94, 180 * k, E))
     crudo = os.path.join(trabajo, 'escena_textura.glb')
     if not os.path.exists(crudo):
@@ -138,7 +144,7 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
 
     avisar(94, 'Recortando la mesa y ajustando el tamaño real' if modo != 'ambiente' else 'Enderezando el ambiente y midiendo')
     final = os.path.join(trabajo, 'modelo.glb' if modo != 'plato' else 'plato.glb')
-    dims = limpiar(crudo, final, ancho_cm, modo=modo, arriba=arriba, cajas=cajas, sparse_dir=os.path.join(dense, 'sparse'))
+    dims = limpiar(crudo, final, ancho_cm, modo=modo, arriba=arriba, cajas=None if plano is not None else cajas, sparse_dir=os.path.join(dense, 'sparse'), plano=plano)
     import json as _json
     with open(final + '.json', 'w') as f:
         _json.dump(dims, f)
@@ -263,7 +269,39 @@ def _dentro_de_cajas(v, cajas, sparse_dir, margen=0.08):
         return None
 
 
-def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=None, cajas=None, sparse_dir=None):
+def _recortar_objeto(entrada, salida, arriba, cajas, sparse_dir):
+    """Deja solo el objeto: saca la mesa (y todo lo que está debajo), lo que cae fuera del recuadro marcado
+    y las cosas sueltas. Devuelve el plano de la mesa (n, d, tol) o None si no se pudo (se sigue con todo)."""
+    try:
+        m = trimesh.load(entrada, process=False)
+        v = m.vertices
+        n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
+        dist = v @ n + d
+        if arriba is not None and abs(n @ arriba) > 0.5:
+            if n @ arriba < 0:
+                n, d, dist = -n, -d, -dist
+        elif np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
+            n, d, dist = -n, -d, -dist
+        ok = dist > tol * 2.5  # todo lo que está apoyado arriba de la mesa, sin la mesa
+        if cajas and sparse_dir:
+            dentro = _dentro_de_cajas(v, cajas, sparse_dir)
+            if dentro is not None:
+                ok &= dentro
+        caras = np.nonzero(ok[m.faces].all(axis=1))[0]
+        print(f'  objeto separado: {len(caras)} de {len(m.faces)} caras', file=sys.stderr)
+        if len(caras) < 300:
+            return None
+        sub = _quedarse_con_el_plato(m.submesh([caras], append=True), n)
+        if len(sub.faces) < 300:
+            return None
+        sub.export(salida)
+        return (n, d, tol)
+    except Exception as e:
+        print('aviso recorte:', e, file=sys.stderr)
+        return None
+
+
+def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=None, cajas=None, sparse_dir=None, plano=None):
     scene = trimesh.load(entrada, force='scene')
     geoms = [g for g in scene.dump() if isinstance(g, trimesh.Trimesh)]
     if not geoms:
@@ -280,11 +318,17 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=No
             if len(caras) > 500:
                 m = m.submesh([caras], append=True)
     v = m.vertices
-    # 1) la mesa es el plano más grande: lo usamos como piso
-    n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
-    dist = v @ n + d
+    # 1) la mesa es el plano más grande: lo usamos como piso (si ya se recortó antes, viene medido)
+    if plano is not None:
+        n, d, tol = plano
+        dist = v @ n + d
+    else:
+        n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
+        dist = v @ n + d
     # el plato queda del lado del plano donde hay más volumen
-    if arriba is not None and abs(n @ arriba) > 0.5:
+    if plano is not None:
+        pass
+    elif arriba is not None and abs(n @ arriba) > 0.5:
         if n @ arriba < 0:
             n, d, dist = -n, -d, -dist
     elif np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
