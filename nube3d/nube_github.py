@@ -85,7 +85,7 @@ def hacer(r):
         avisar(3, 'Bajando las fotos')
         for f in r['fotos']:
             bajar(f['url'], os.path.join(fotos, f['nombre']))
-        glb = procesar(fotos, os.path.join(carpeta, 'trabajo'), float(r['ancho_cm']), avisar=avisar, hilos=0, gpu=False)
+        glb = procesar(fotos, os.path.join(carpeta, 'trabajo'), float(r['ancho_cm']), avisar=avisar, mvs_dir=os.environ.get('MVS_DIR') or None, hilos=0, gpu=False)
         avisar(97, 'Publicando el modelo')
         lugar = nube('lugar_modelo', id=eid)
         subir(lugar['subir'], glb)
