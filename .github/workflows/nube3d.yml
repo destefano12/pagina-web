@@ -1,0 +1,47 @@
+name: Nube de escaneo 3D
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nube3d
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  escanear:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      MVS_DIR: ${{ github.workspace }}/herramientas/openmvs
+      TRABAJOS_DIR: ${{ runner.temp }}/trabajos
+      WORKER_NOMBRE: github-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ¿Hay platos esperando?
+        id: cola
+        run: python3 nube3d/nube_github.py hay
+
+      - name: Instalar COLMAP y librerías
+        if: steps.cola.outputs.hay == 'si'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends colmap \
+            libopencv-calib3d406t64 libopencv-features2d406t64 libopencv-imgcodecs406t64 libopencv-imgproc406t64 \
+            libboost-iostreams1.83.0 libboost-program-options1.83.0 libboost-serialization1.83.0 \
+            libgomp1 libglx0 libgmp10 > /dev/null
+          chmod +x herramientas/openmvs/*
+          if ldd herramientas/openmvs/DensifyPointCloud | grep "not found"; then exit 1; fi
+          pip install -q --break-system-packages -r nube3d/requirements.txt
+
+      - name: Armar los modelos 3D
+        if: steps.cola.outputs.hay == 'si'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 nube3d/nube_github.py

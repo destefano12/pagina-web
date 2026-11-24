@@ -1,0 +1,218 @@
+"""Fotogrametría: fotos de un plato -> modelo 3D real (.glb) a tamaño real.
+
+Usa COLMAP (estructura desde movimiento) + OpenMVS (nube densa, malla y textura),
+ambos gratis y de código abierto. Después recorta la mesa, endereza el plato,
+lo escala al ancho real y exporta un .glb liviano para ver en el celular.
+"""
+import glob
+import io
+import os
+import shutil
+import subprocess
+import sys
+
+import numpy as np
+import trimesh
+from PIL import Image
+
+EXE = '.exe' if os.name == 'nt' else ''
+
+
+class ErrorFoto(Exception):
+    """Error que se le puede mostrar al restaurante tal cual."""
+
+
+def _bin(carpeta, nombre):
+    if carpeta:
+        for cand in (os.path.join(carpeta, nombre + EXE), os.path.join(carpeta, 'bin', nombre + EXE)):
+            if os.path.exists(cand):
+                return cand
+    found = shutil.which(nombre)
+    if not found:
+        raise RuntimeError(f'No encuentro el programa {nombre}. Revisá la instalación.')
+    return found
+
+
+def _run(cmd, cwd, log):
+    log.write('\n$ ' + ' '.join(map(str, cmd)) + '\n'); log.flush()
+    p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+    if p.returncode != 0:
+        raise RuntimeError(f'Falló {os.path.basename(str(cmd[0]))} (código {p.returncode}). Ver registro.log')
+
+
+def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colmap_dir=None, mvs_dir=None, hilos=0, gpu=False):
+    """Devuelve la ruta del .glb final."""
+    os.makedirs(trabajo, exist_ok=True)
+    colmap = _bin(colmap_dir, 'colmap') if not (colmap_dir and os.path.exists(os.path.join(colmap_dir, 'COLMAP.bat'))) else os.path.join(colmap_dir, 'COLMAP.bat')
+    mvs = lambda n: _bin(mvs_dir, n)
+    log = open(os.path.join(trabajo, 'registro.log'), 'a', encoding='utf-8')
+    fotos = sorted(f for f in glob.glob(os.path.join(fotos_dir, '*')) if f.lower().endswith(('.jpg', '.jpeg', '.png')))
+    if len(fotos) < 15:
+        raise ErrorFoto(f'Llegaron {len(fotos)} fotos y hacen falta al menos 15.')
+    g = '1' if gpu else '0'
+    db = os.path.join(trabajo, 'db.db')
+    sparse = os.path.join(trabajo, 'sparse'); os.makedirs(sparse, exist_ok=True)
+
+    avisar(8, 'Buscando puntos en las fotos')
+    _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
+          '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
+          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', '1600'], trabajo, log)
+    avisar(18, 'Uniendo las fotos entre sí')
+    _run([colmap, 'exhaustive_matcher', '--database_path', db, '--SiftMatching.use_gpu', g], trabajo, log)
+    avisar(30, 'Calculando dónde estaba la cámara')
+    _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log)
+    modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
+    if not modelos:
+        raise ErrorFoto('No se pudieron unir las fotos. Sacalas con más luz, sin moverte rápido y dando la vuelta completa al plato.')
+    mejor = max(modelos, key=lambda d: os.path.getsize(os.path.join(d, 'images.bin')) if os.path.exists(os.path.join(d, 'images.bin')) else 0)
+
+    avisar(38, 'Preparando las fotos')
+    dense = os.path.join(trabajo, 'dense')
+    _run([colmap, 'image_undistorter', '--image_path', fotos_dir, '--input_path', mejor, '--output_path', dense,
+          '--output_type', 'COLMAP', '--max_image_size', '1600'], trabajo, log)
+    # OpenMVS espera los parámetros de cámara en texto
+    sp = os.path.join(dense, 'sparse')
+    _run([colmap, 'model_converter', '--input_path', sp, '--output_path', sp, '--output_type', 'TXT'], trabajo, log)
+
+    th = ['--max-threads', str(hilos)] if hilos else []
+    avisar(45, 'Convirtiendo la escena')
+    _run([mvs('InterfaceCOLMAP'), '-i', dense, '-o', 'escena.mvs', '--image-folder', os.path.join(dense, 'images'), '-v', '1'], trabajo, log)
+    avisar(52, 'Armando la nube de puntos densa (es lo que más tarda)')
+    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', '1', '-v', '1', *th], trabajo, log)
+    avisar(75, 'Creando la superficie')
+    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '-v', '1', *th], trabajo, log)
+    avisar(85, 'Pintando la textura')
+    _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', 'escena_dense_mesh.ply', '--decimate', '0.6',
+          '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log)
+    crudo = os.path.join(trabajo, 'escena_textura.glb')
+    if not os.path.exists(crudo):
+        raise RuntimeError('OpenMVS no generó el modelo con textura')
+
+    avisar(94, 'Recortando la mesa y ajustando el tamaño real')
+    final = os.path.join(trabajo, 'plato.glb')
+    limpiar(crudo, final, ancho_cm)
+    log.close()
+    return final
+
+
+def _plano_ransac(v, iters=600, tol=None, rng=np.random.default_rng(7)):
+    ext = np.ptp(v, axis=0).max()
+    tol = tol or ext * 0.004
+    best, best_n = None, -1
+    for _ in range(iters):
+        a, b, c = v[rng.choice(len(v), 3, replace=False)]
+        n = np.cross(b - a, c - a); ln = np.linalg.norm(n)
+        if ln < 1e-12: continue
+        n /= ln; d = -n @ a
+        cnt = np.count_nonzero(np.abs(v @ n + d) < tol)
+        if cnt > best_n: best, best_n = (n, d), cnt
+    n, d = best
+    # ajuste fino por mínimos cuadrados con los inliers
+    ins = v[np.abs(v @ n + d) < tol]
+    c = ins.mean(0); u, s, vt = np.linalg.svd(ins - c, full_matrices=False)
+    n = vt[2]; d = -n @ c
+    return n, d, tol
+
+
+def _rot_a(n, destino=np.array([0, 1.0, 0])):
+    n = n / np.linalg.norm(n); v = np.cross(n, destino); s = np.linalg.norm(v); c = n @ destino
+    if s < 1e-9:
+        return np.eye(3) if c > 0 else np.diag([1, -1, -1.0])
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / s ** 2)
+
+
+def _componentes(m):
+    eps = max(np.ptp(m.vertices, axis=0).max() * 1e-6, 1e-9)
+    _, inv = np.unique(np.round(m.vertices / eps).astype(np.int64), axis=0, return_inverse=True)
+    t = trimesh.Trimesh(vertices=np.zeros((inv.max() + 1, 3)), faces=inv.reshape(-1)[m.faces], process=False)
+    return trimesh.graph.connected_component_labels(t.face_adjacency, node_count=len(m.faces))
+
+
+def _quedarse_con_el_plato(sub, n):
+    lab = _componentes(sub)
+    areas = np.bincount(lab, weights=sub.area_faces)
+    principal = int(np.argmax(areas))
+    # horizontal = proyección sobre el plano de la mesa
+    R = _rot_a(n)
+    cen = (sub.triangles_center @ R.T)[:, [0, 2]]
+    def caja(mask):
+        c = cen[mask]; return c.min(0), c.max(0)
+    lo, hi = caja(lab == principal)
+    centro, radio = (lo + hi) / 2, np.linalg.norm(hi - lo) / 2
+    keep = np.zeros(len(areas), bool)
+    for k in np.nonzero(areas > areas.sum() * 0.002)[0]:
+        c = cen[lab == k].mean(0)
+        keep[k] = np.linalg.norm(c - centro) < radio * 1.35
+    keep[principal] = True
+    # una segunda pasada: lo que quedó pegado a lo elegido amplía la zona (papas, salsas al costado)
+    lo, hi = caja(keep[lab]); centro, radio = (lo + hi) / 2, np.linalg.norm(hi - lo) / 2
+    for k in np.nonzero((areas > areas.sum() * 0.002) & ~keep)[0]:
+        keep[k] = np.linalg.norm(cen[lab == k].mean(0) - centro) < radio * 1.1
+    caras = np.nonzero(keep[lab])[0]
+    return sub.submesh([caras], append=True)
+
+
+def limpiar(entrada, salida, ancho_cm, max_caras=250000):
+    scene = trimesh.load(entrada, force='scene')
+    geoms = [g for g in scene.dump() if isinstance(g, trimesh.Trimesh)]
+    if not geoms:
+        raise ErrorFoto('El modelo salió vacío')
+    m = max(geoms, key=lambda g: len(g.faces)) if len(geoms) == 1 else trimesh.util.concatenate(geoms)
+    v = m.vertices
+    # 1) la mesa es el plano más grande: lo usamos como piso
+    n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
+    dist = v @ n + d
+    # el plato queda del lado del plano donde hay más volumen
+    if np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
+        n, d, dist = -n, -d, -dist
+    # 2) nos quedamos con lo que está arriba de la mesa
+    arriba = dist > tol * 1.5
+    caras_ok = arriba[m.faces].all(axis=1)
+    if caras_ok.sum() < 200:
+        raise ErrorFoto('No se distingue el plato de la mesa. Usá una mesa opaca con algo de textura (madera, mantel de tela) y que el plato ocupe buena parte de la foto.')
+    sub = m.submesh([np.nonzero(caras_ok)[0]], append=True)
+    # 3) componente principal (descarta migas y cosas sueltas en la mesa).
+    #    La textura parte la malla en parches con vértices repetidos: para ver qué está conectado
+    #    se unen los vértices por posición.
+    sub = _quedarse_con_el_plato(sub, n)
+    # 4) enderezar (mesa = piso), apoyar en y=0 y centrar
+    R = _rot_a(n)
+    T = np.eye(4); T[:3, :3] = R
+    sub.apply_transform(T)
+    piso = -(d) * 1.0  # distancia del origen al plano ya no importa: apoyamos por el mínimo
+    sub.apply_translation([-sub.bounds[:, 0].mean(), -sub.bounds[0, 1], -sub.bounds[:, 2].mean()])
+    # 5) escala real: el ancho horizontal mayor = ancho del plato
+    xz = sub.vertices[:, [0, 2]]
+    xz = xz - xz.mean(0); _, _, vt = np.linalg.svd(xz, full_matrices=False)
+    ancho = np.ptp(xz @ vt.T, axis=0).max()
+    k = (float(ancho_cm) / 100.0) / max(ancho, 1e-9)
+    sub.apply_scale(k)
+    # 6) aliviar: menos caras y textura en JPG
+    if len(sub.faces) > max_caras:
+        try:
+            sub = sub.simplify_quadric_decimation(face_count=max_caras)
+        except Exception:
+            pass
+    try:
+        mat = sub.visual.material
+        img = getattr(mat, 'baseColorTexture', None) or getattr(mat, 'image', None)
+        if img is not None:
+            img = img.convert('RGB')
+            if max(img.size) > 4096: img.thumbnail((4096, 4096))
+            buf = io.BytesIO(); img.save(buf, 'JPEG', quality=86); buf.seek(0)
+            jpg = Image.open(buf)
+            if hasattr(mat, 'baseColorTexture'): mat.baseColorTexture = jpg
+            else: mat.image = jpg
+            if hasattr(mat, 'roughnessFactor'): mat.roughnessFactor = 0.7; mat.metallicFactor = 0.0
+    except Exception as e:
+        print('aviso textura:', e, file=sys.stderr)
+    sub.export(salida)
+    return salida
+
+
+if __name__ == '__main__':
+    # uso de prueba: python fotogrametria.py carpeta_fotos carpeta_trabajo ancho_cm
+    f, t, a = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    print(procesar(f, t, a, avisar=lambda p, e: print(f'[{p:3d}%] {e}', flush=True),
+                   colmap_dir=os.environ.get('COLMAP_DIR'), mvs_dir=os.environ.get('MVS_DIR')))
