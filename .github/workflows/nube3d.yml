@@ -19,7 +19,6 @@ jobs:
     timeout-minutes: 150
     env:
       MVS_DIR: ${{ github.workspace }}/herramientas/openmvs
-      TRABAJOS_DIR: ${{ runner.temp }}/trabajos
       WORKER_NOMBRE: github-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
