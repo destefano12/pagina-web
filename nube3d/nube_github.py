@@ -109,12 +109,36 @@ def hacer(r):
         shutil.rmtree(carpeta, ignore_errors=True)
 
 
+HORARIO = (9, 24)  # hora de Argentina en la que la nube queda esperando escaneos
+VIGILAR_MIN = 285  # cada tarea vigila unas 4 h 45 min y deja otra en su lugar
+
+
+def en_horario():
+    h = (time.gmtime().tm_hour - 3) % 24
+    return HORARIO[0] <= h < HORARIO[1]
+
+
+def relevo():
+    """Arranca la próxima tarea (la que sigue esperando) con la clave propia de esta tarea de GitHub."""
+    tok, repo = os.environ.get('GH_TOKEN'), os.environ.get('GITHUB_REPOSITORY')
+    if not tok or not repo:
+        return
+    req = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/workflows/nube3d.yml/dispatches',
+                                 data=json.dumps({'ref': 'main'}).encode(), method='POST',
+                                 headers={'Authorization': 'Bearer ' + tok, 'Accept': 'application/vnd.github+json'})
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+        print('Dejé la próxima tarea en marcha.', flush=True)
+    except Exception as e:
+        print('No pude dejar la próxima tarea:', e, flush=True)
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'hay':
         n = nube('hay')['pendientes']
         print(f'Escaneos en la cola: {n}')
         with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
-            f.write(f'hay={"si" if n else "no"}\n')
+            f.write(f'hay={"si" if n or en_horario() else "no"}\n')
         return
     inicio, vacio = time.time(), 0
     while True:
@@ -126,6 +150,13 @@ def main():
         # La cola está vacía: se espera un rato por si alguien está terminando de subir otro escaneo,
         # así no queda esperando a la próxima vuelta.
         vacio += 1
+        if en_horario():
+            # en horario, la nube queda esperando; al final deja otra tarea en su lugar
+            if time.time() - inicio > VIGILAR_MIN * 60:
+                relevo()
+                return
+            time.sleep(15)
+            continue
         if vacio > 8 or time.time() - inicio > 120 * 60:
             print('No hay más escaneos en la cola.')
             return

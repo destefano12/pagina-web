@@ -3,6 +3,7 @@ name: Nube de escaneo 3D
 on:
   schedule:
     - cron: '*/5 * * * *'
+    - cron: '0 12 * * *'  # 9 de la mañana en Argentina: arranca la nube del día
   workflow_dispatch:
 
 concurrency:
@@ -12,11 +13,12 @@ concurrency:
 permissions:
   id-token: write
   contents: read
+  actions: write
 
 jobs:
   escanear:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 355
     env:
       MVS_DIR: ${{ github.workspace }}/herramientas/openmvs
       WORKER_NOMBRE: github-${{ github.run_id }}
@@ -43,4 +45,5 @@ jobs:
         if: steps.cola.outputs.hay == 'si'
         env:
           QT_QPA_PLATFORM: offscreen
+          GH_TOKEN: ${{ github.token }}
         run: python3 nube3d/nube_github.py
