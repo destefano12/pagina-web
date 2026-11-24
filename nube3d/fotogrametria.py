@@ -6,10 +6,13 @@ lo escala al ancho real y exporta un .glb liviano para ver en el celular.
 """
 import glob
 import io
+import math
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 import numpy as np
 import trimesh
@@ -33,9 +36,24 @@ def _bin(carpeta, nombre):
     return found
 
 
-def _run(cmd, cwd, log):
+def _run(cmd, cwd, log, avance=None):
+    """avance = (avisar, desde, hasta, segundos_estimados, etapa): mientras corre el paso, el % sigue
+    subiendo despacio hacia `hasta` (sin llegar), así la barra nunca se queda quieta."""
     log.write('\n$ ' + ' '.join(map(str, cmd)) + '\n'); log.flush()
-    p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+    listo = threading.Event()
+    if avance:
+        avisar, desde, hasta, seg, etapa = avance
+        def latir():
+            t0 = time.time(); ultimo = desde
+            while not listo.wait(8):
+                pct = int(desde + (hasta - 1 - desde) * (1 - math.exp(-(time.time() - t0) / seg)))
+                if pct > ultimo:
+                    ultimo = pct; avisar(pct, etapa)
+        threading.Thread(target=latir, daemon=True).start()
+    try:
+        p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+    finally:
+        listo.set()
     if p.returncode != 0:
         raise RuntimeError(f'Falló {os.path.basename(str(cmd[0]))} (código {p.returncode}). Ver registro.log')
 
@@ -55,28 +73,29 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     if len(fotos) < 15:
         raise ErrorFoto(f'Llegaron {len(fotos)} fotos y hacen falta al menos 15.')
     g = '1' if gpu else '0'
+    k = max(0.5, len(fotos) / 45)  # los tiempos estimados son para 45 fotos
     db = os.path.join(trabajo, 'db.db')
     sparse = os.path.join(trabajo, 'sparse'); os.makedirs(sparse, exist_ok=True)
 
-    avisar(8, 'Buscando puntos en las fotos')
+    E = 'Buscando puntos en las fotos'; avisar(8, E)
     _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
           '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
           '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(TAM),
-          '--SiftExtraction.max_num_features', '12000'], trabajo, log)
-    avisar(18, 'Uniendo las fotos entre sí')
+          '--SiftExtraction.max_num_features', '12000'], trabajo, log, (avisar, 8, 18, 120 * k, E))
+    E = 'Uniendo las fotos entre sí'; avisar(18, E)
     _run([colmap, 'exhaustive_matcher', '--database_path', db, '--SiftMatching.use_gpu', g,
-          '--SiftMatching.guided_matching', '1'], trabajo, log)
-    avisar(30, 'Calculando dónde estaba la cámara')
-    _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log)
+          '--SiftMatching.guided_matching', '1'], trabajo, log, (avisar, 18, 30, 400 * k, E))
+    E = 'Calculando dónde estaba la cámara'; avisar(30, E)
+    _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log, (avisar, 30, 38, 250 * k, E))
     modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
     if not modelos:
         raise ErrorFoto('No se pudieron unir las fotos. Sacalas con más luz, sin moverte rápido y dando la vuelta completa al plato.')
     mejor = max(modelos, key=lambda d: os.path.getsize(os.path.join(d, 'images.bin')) if os.path.exists(os.path.join(d, 'images.bin')) else 0)
 
-    avisar(38, 'Preparando las fotos')
+    E = 'Preparando las fotos'; avisar(38, E)
     dense = os.path.join(trabajo, 'dense')
     _run([colmap, 'image_undistorter', '--image_path', fotos_dir, '--input_path', mejor, '--output_path', dense,
-          '--output_type', 'COLMAP', '--max_image_size', str(TAM)], trabajo, log)
+          '--output_type', 'COLMAP', '--max_image_size', str(TAM)], trabajo, log, (avisar, 38, 44, 40 * k, E))
     # OpenMVS espera los parámetros de cámara en texto
     sp = os.path.join(dense, 'sparse')
     _run([colmap, 'model_converter', '--input_path', sp, '--output_path', sp, '--output_type', 'TXT'], trabajo, log)
@@ -84,13 +103,13 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     th = ['--max-threads', str(hilos)] if hilos else []
     avisar(45, 'Convirtiendo la escena')
     _run([mvs('InterfaceCOLMAP'), '-i', dense, '-o', 'escena.mvs', '--image-folder', os.path.join(dense, 'images'), '-v', '1'], trabajo, log)
-    avisar(52, 'Armando la nube de puntos densa (es lo que más tarda)')
-    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '-v', '1', *th], trabajo, log)
-    avisar(75, 'Creando la superficie')
-    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '-v', '1', *th], trabajo, log)
-    avisar(85, 'Pintando la textura')
+    E = 'Armando la nube de puntos densa (es lo que más tarda)'; avisar(52, E)
+    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '-v', '1', *th], trabajo, log, (avisar, 52, 75, 900 * k, E))
+    E = 'Creando la superficie'; avisar(75, E)
+    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '-v', '1', *th], trabajo, log, (avisar, 75, 85, 120 * k, E))
+    E = 'Pintando la textura'; avisar(85, E)
     _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', 'escena_dense_mesh.ply', '--decimate', '1',
-          '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log)
+          '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log, (avisar, 85, 94, 180 * k, E))
     crudo = os.path.join(trabajo, 'escena_textura.glb')
     if not os.path.exists(crudo):
         raise RuntimeError('OpenMVS no generó el modelo con textura')
