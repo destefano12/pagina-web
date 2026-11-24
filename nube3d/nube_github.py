@@ -68,8 +68,9 @@ def subir(url, ruta):
 def hacer(r):
     from fotogrametria import ErrorFoto, procesar  # se carga solo si hay trabajo
     e = r['trabajo']; eid = e['id']
+    cola = r.get('cola', 'menu'); modo = r.get('modo') or 'plato'
     carpeta = os.path.join(TRABAJOS, eid); fotos = os.path.join(carpeta, 'fotos'); os.makedirs(fotos, exist_ok=True)
-    print(f'\n== Escaneo {eid}: {len(r["fotos"])} fotos, ancho {r["ancho_cm"]} cm', flush=True)
+    print(f'\n== Escaneo {eid} ({cola}/{modo}): {len(r["fotos"])} fotos, medida {r.get("ancho_cm")} cm', flush=True)
     ultimo = [0.0]
 
     def avisar(pct, etapa):
@@ -77,7 +78,7 @@ def hacer(r):
         if time.time() - ultimo[0] > 5 or pct >= 90:
             ultimo[0] = time.time()
             try:
-                nube('actualizar', id=eid, campos={'progreso': int(pct), 'etapa': etapa})
+                nube('actualizar', id=eid, cola=cola, campos={'progreso': int(pct), 'etapa': etapa})
             except Exception as ex:
                 print('  (no pude avisar el progreso:', ex, ')', flush=True)
 
@@ -85,21 +86,25 @@ def hacer(r):
         avisar(3, 'Bajando las fotos')
         for f in r['fotos']:
             bajar(f['url'], os.path.join(fotos, f['nombre']))
-        glb = procesar(fotos, os.path.join(carpeta, 'trabajo'), float(r['ancho_cm']), avisar=avisar, mvs_dir=os.environ.get('MVS_DIR') or None, hilos=0, gpu=False)
+        ancho = float(r['ancho_cm']) if r.get('ancho_cm') else None
+        glb = procesar(fotos, os.path.join(carpeta, 'trabajo'), ancho, avisar=avisar, mvs_dir=os.environ.get('MVS_DIR') or None, hilos=0, gpu=False, modo=modo)
+        dims = {}
+        if os.path.exists(glb + '.json'):
+            dims = json.load(open(glb + '.json'))
         avisar(97, 'Publicando el modelo')
-        lugar = nube('lugar_modelo', id=eid)
+        lugar = nube('lugar_modelo', id=eid, cola=cola)
         subir(lugar['subir'], glb)
-        fin = nube('terminar', id=eid, camino=lugar['camino'])
-        print('  LISTO ->', fin.get('url'), flush=True)
+        fin = nube('terminar', id=eid, cola=cola, camino=lugar['camino'], dims=dims)
+        print('  LISTO ->', fin.get('url') or fin.get('camino'), dims, flush=True)
     except ErrorFoto as ex:
         print('  FALLÓ (fotos):', ex, flush=True)
-        nube('actualizar', id=eid, campos={'estado': 'fallo', 'etapa': 'No se pudo armar', 'error': str(ex)})
+        nube('actualizar', id=eid, cola=cola, campos={'estado': 'fallo', 'etapa': 'No se pudo armar', 'error': str(ex)})
     except Exception as ex:
         traceback.print_exc()
         reg = os.path.join(carpeta, 'trabajo', 'registro.log')
         if os.path.exists(reg):
             print(open(reg, encoding='utf-8', errors='replace').read()[-4000:])
-        nube('actualizar', id=eid, campos={'estado': 'fallo', 'etapa': 'Error de la nube', 'error': f'Error al procesar: {ex}'[:300]})
+        nube('actualizar', id=eid, cola=cola, campos={'estado': 'fallo', 'etapa': 'Error de la nube', 'error': f'Error al procesar: {ex}'[:300]})
     finally:
         shutil.rmtree(carpeta, ignore_errors=True)
 

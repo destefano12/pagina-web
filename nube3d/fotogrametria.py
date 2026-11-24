@@ -63,8 +63,9 @@ TAM = int(os.environ.get('CALIDAD_TAM', '3200'))
 NIVEL = int(os.environ.get('CALIDAD_NIVEL', '1'))
 
 
-def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colmap_dir=None, mvs_dir=None, hilos=0, gpu=False):
-    """Devuelve la ruta del .glb final."""
+def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colmap_dir=None, mvs_dir=None, hilos=0, gpu=False, modo='plato'):
+    """Devuelve la ruta del .glb final. modo: 'plato' (menú), 'objeto' o 'ambiente' (Metra 3D).
+    Las medidas finales quedan en <glb>.json. ancho_cm puede ser None (sin escala real)."""
     os.makedirs(trabajo, exist_ok=True)
     colmap = _bin(colmap_dir, 'colmap') if not (colmap_dir and os.path.exists(os.path.join(colmap_dir, 'COLMAP.bat'))) else os.path.join(colmap_dir, 'COLMAP.bat')
     mvs = lambda n: _bin(mvs_dir, n)
@@ -89,7 +90,7 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log, (avisar, 30, 38, 250 * k, E))
     modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
     if not modelos:
-        raise ErrorFoto('No se pudieron unir las fotos. Sacalas con más luz, sin moverte rápido y dando la vuelta completa al plato.')
+        raise ErrorFoto('No se pudieron unir las fotos. Sacalas con más luz, sin moverte rápido y dando la vuelta completa.')
     mejor = max(modelos, key=lambda d: os.path.getsize(os.path.join(d, 'images.bin')) if os.path.exists(os.path.join(d, 'images.bin')) else 0)
 
     E = 'Preparando las fotos'; avisar(38, E)
@@ -99,6 +100,7 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     # OpenMVS espera los parámetros de cámara en texto
     sp = os.path.join(dense, 'sparse')
     _run([colmap, 'model_converter', '--input_path', sp, '--output_path', sp, '--output_type', 'TXT'], trabajo, log)
+    arriba = _arriba_camaras(os.path.join(sp, 'images.txt'))
 
     th = ['--max-threads', str(hilos)] if hilos else []
     avisar(45, 'Convirtiendo la escena')
@@ -114,11 +116,36 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     if not os.path.exists(crudo):
         raise RuntimeError('OpenMVS no generó el modelo con textura')
 
-    avisar(94, 'Recortando la mesa y ajustando el tamaño real')
-    final = os.path.join(trabajo, 'plato.glb')
-    limpiar(crudo, final, ancho_cm)
+    avisar(94, 'Recortando la mesa y ajustando el tamaño real' if modo != 'ambiente' else 'Enderezando el ambiente y midiendo')
+    final = os.path.join(trabajo, 'modelo.glb' if modo != 'plato' else 'plato.glb')
+    dims = limpiar(crudo, final, ancho_cm, modo=modo, arriba=arriba)
+    import json as _json
+    with open(final + '.json', 'w') as f:
+        _json.dump(dims, f)
     log.close()
     return final
+
+
+def _arriba_camaras(images_txt):
+    """Promedia el 'arriba' de cada foto (el teléfono se sostiene derecho): da la vertical real de la escena."""
+    try:
+        ups = []
+        with open(images_txt, encoding='utf-8') as f:
+            lineas = [l for l in f if l.strip() and not l.startswith('#')]
+        for l in lineas[0::2]:
+            p = l.split()
+            qw, qx, qy, qz = map(float, p[1:5])
+            R = np.array([[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                          [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                          [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
+            ups.append(-R[1, :])  # eje Y de la cámara apunta hacia abajo en la imagen
+        if len(ups) < 5:
+            return None
+        u = np.mean(ups, axis=0); n = np.linalg.norm(u)
+        return u / n if n > 0.3 else None
+    except Exception as e:
+        print('aviso arriba:', e, file=sys.stderr)
+        return None
 
 
 def _plano_ransac(v, iters=600, tol=None, rng=np.random.default_rng(7)):
@@ -179,24 +206,29 @@ def _quedarse_con_el_plato(sub, n):
     return sub.submesh([caras], append=True)
 
 
-def limpiar(entrada, salida, ancho_cm, max_caras=250000):
+def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=None):
     scene = trimesh.load(entrada, force='scene')
     geoms = [g for g in scene.dump() if isinstance(g, trimesh.Trimesh)]
     if not geoms:
         raise ErrorFoto('El modelo salió vacío')
     m = max(geoms, key=lambda g: len(g.faces)) if len(geoms) == 1 else trimesh.util.concatenate(geoms)
+    if modo == 'ambiente':
+        return _limpiar_ambiente(m, salida, ancho_cm, arriba, max_caras=max(max_caras, 400000))
     v = m.vertices
     # 1) la mesa es el plano más grande: lo usamos como piso
     n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
     dist = v @ n + d
     # el plato queda del lado del plano donde hay más volumen
-    if np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
+    if arriba is not None and abs(n @ arriba) > 0.5:
+        if n @ arriba < 0:
+            n, d, dist = -n, -d, -dist
+    elif np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
         n, d, dist = -n, -d, -dist
     # 2) nos quedamos con lo que está arriba de la mesa
     arriba = dist > tol * 1.5
     caras_ok = arriba[m.faces].all(axis=1)
     if caras_ok.sum() < 200:
-        raise ErrorFoto('No se distingue el plato de la mesa. Usá una mesa opaca con algo de textura (madera, mantel de tela) y que el plato ocupe buena parte de la foto.')
+        raise ErrorFoto('No se distingue el objeto de la superficie donde está apoyado. Usá una superficie opaca con algo de textura (madera, mantel de tela) y que el objeto ocupe buena parte de la foto.')
     sub = m.submesh([np.nonzero(caras_ok)[0]], append=True)
     # 3) componente principal (descarta migas y cosas sueltas en la mesa).
     #    La textura parte la malla en parches con vértices repetidos: para ver qué está conectado
@@ -212,7 +244,8 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000):
     xz = sub.vertices[:, [0, 2]]
     xz = xz - xz.mean(0); _, _, vt = np.linalg.svd(xz, full_matrices=False)
     ancho = np.ptp(xz @ vt.T, axis=0).max()
-    k = (float(ancho_cm) / 100.0) / max(ancho, 1e-9)
+    # sin medida real: se deja a 1 m de lado mayor y se avisa que no tiene escala
+    k = ((float(ancho_cm) / 100.0) if ancho_cm else 1.0) / max(ancho, 1e-9)
     sub.apply_scale(k)
     # 6) aliviar: menos caras y textura en JPG
     if len(sub.faces) > max_caras:
@@ -234,11 +267,81 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000):
     except Exception as e:
         print('aviso textura:', e, file=sys.stderr)
     sub.export(salida)
-    return salida
+    return _medidas(sub, bool(ancho_cm))
+
+
+def _medidas(m, escala):
+    xz = m.vertices[:, [0, 2]]; c = xz.mean(0)
+    _, _, vt = np.linalg.svd(xz - c, full_matrices=False)
+    ext = np.ptp((xz - c) @ vt.T, axis=0)
+    d = {'ancho': float(ext.max()), 'prof': float(ext.min()), 'alto': float(np.ptp(m.vertices[:, 1])), 'escala': escala}
+    try:
+        d['area'] = float(m.area)
+    except Exception:
+        pass
+    return d
+
+
+def _limpiar_ambiente(m, salida, ancho_cm, arriba, max_caras=400000):
+    """Ambiente: endereza (piso abajo), lo apoya en y=0, descarta basura flotante y lo pone a escala."""
+    v = m.vertices
+    if arriba is None:
+        # sin cámaras: el plano grande con más cosas de un solo lado se toma como piso
+        n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
+        arriba = n if np.count_nonzero(v @ n + d > 0) > len(v) / 2 else -n
+    R = _rot_a(np.asarray(arriba, float))
+    T = np.eye(4); T[:3, :3] = R
+    m.apply_transform(T)
+    # descartar partes sueltas chicas (reflejos, ventanas)
+    try:
+        lab = _componentes(m)
+        areas = np.bincount(lab, weights=m.area_faces)
+        keep = areas > areas.sum() * 0.01
+        m = m.submesh([np.nonzero(keep[lab])[0]], append=True)
+    except Exception as e:
+        print('aviso componentes:', e, file=sys.stderr)
+    # recorte robusto: sin el 0,5 % más extremo en cada eje
+    lo = np.percentile(m.vertices, 0.5, axis=0); hi = np.percentile(m.vertices, 99.5, axis=0)
+    dentro = np.all((m.vertices >= lo) & (m.vertices <= hi), axis=1)
+    caras = np.nonzero(dentro[m.faces].all(axis=1))[0]
+    if len(caras) > 1000:
+        m = m.submesh([caras], append=True)
+    # piso en y=0, centrado
+    piso = np.percentile(m.vertices[:, 1], 1.0)
+    m.apply_translation([-m.bounds[:, 0].mean(), -piso, -m.bounds[:, 2].mean()])
+    # escala: la medida que da el usuario es el largo del ambiente (lado horizontal mayor)
+    xz = m.vertices[:, [0, 2]]; c = xz.mean(0)
+    _, _, vt = np.linalg.svd(xz - c, full_matrices=False)
+    largo = np.ptp((xz - c) @ vt.T, axis=0).max()
+    k = ((float(ancho_cm) / 100.0) if ancho_cm else 5.0) / max(largo, 1e-9)
+    m.apply_scale(k)
+    if len(m.faces) > max_caras:
+        try:
+            m = m.simplify_quadric_decimation(face_count=max_caras)
+        except Exception:
+            pass
+    try:
+        mat = m.visual.material
+        img = getattr(mat, 'baseColorTexture', None) or getattr(mat, 'image', None)
+        if img is not None:
+            img = img.convert('RGB')
+            if max(img.size) > 4096: img.thumbnail((4096, 4096))
+            buf = io.BytesIO(); img.save(buf, 'JPEG', quality=86); buf.seek(0)
+            jpg = Image.open(buf)
+            if hasattr(mat, 'baseColorTexture'): mat.baseColorTexture = jpg
+            else: mat.image = jpg
+            if hasattr(mat, 'roughnessFactor'): mat.roughnessFactor = 0.85; mat.metallicFactor = 0.0
+    except Exception as e:
+        print('aviso textura:', e, file=sys.stderr)
+    m.export(salida)
+    d = _medidas(m, bool(ancho_cm))
+    d['alto'] = float(np.percentile(m.vertices[:, 1], 99.0))  # piso a techo
+    return d
 
 
 if __name__ == '__main__':
-    # uso de prueba: python fotogrametria.py carpeta_fotos carpeta_trabajo ancho_cm
-    f, t, a = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    # uso de prueba: python fotogrametria.py carpeta_fotos carpeta_trabajo ancho_cm [plato|objeto|ambiente]
+    f, t, a = sys.argv[1], sys.argv[2], (float(sys.argv[3]) or None)
     print(procesar(f, t, a, avisar=lambda p, e: print(f'[{p:3d}%] {e}', flush=True),
-                   colmap_dir=os.environ.get('COLMAP_DIR'), mvs_dir=os.environ.get('MVS_DIR')))
+                   colmap_dir=os.environ.get('COLMAP_DIR'), mvs_dir=os.environ.get('MVS_DIR'),
+                   modo=sys.argv[4] if len(sys.argv) > 4 else 'plato'))
