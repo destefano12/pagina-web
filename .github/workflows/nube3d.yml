@@ -39,11 +39,19 @@ jobs:
             libgomp1 libglx0 libgmp10 > /dev/null
           chmod +x herramientas/openmvs/*
           if ldd herramientas/openmvs/DensifyPointCloud | grep "not found"; then exit 1; fi
-          pip install -q --break-system-packages -r nube3d/requirements.txt
+          # misma versión de librerías que el motor en Docker (motor3d/docker/bloqueo-worker.txt)
+          pip install -q --break-system-packages -r nube3d/requirements.txt -c motor3d/docker/bloqueo-worker.txt
+          # gltfpack (meshoptimizer, MIT): reduce la malla respetando la textura y comprime la versión para celular
+          curl -fsSL -o /tmp/gltfpack.zip https://github.com/zeux/meshoptimizer/releases/download/v0.24/gltfpack-ubuntu.zip
+          sudo unzip -o -q /tmp/gltfpack.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/gltfpack
+          gltfpack -v 2>&1 | head -1 || true
 
       - name: Armar los modelos 3D
         if: steps.cola.outputs.hay == 'si'
         env:
           QT_QPA_PLATFORM: offscreen
+          DENSA_MAX: '1600'
+          TEXTURA_MAX: '4096'
+          LIMITE_PASO_S: '10800'
           GH_TOKEN: ${{ github.token }}
         run: python3 nube3d/nube_github.py

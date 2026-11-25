@@ -128,8 +128,10 @@ def generar(limpio: str, trabajo: str, usadas: str, cajas, inf) -> dict:
     _con_textura(base, MOVIL_TEX, 85).export(tmp_c)
     if not _gltfpack(tmp_m, maestro, MAESTRO_CARAS, caras, comprimir=False):
         shutil.copy(tmp_m, maestro)
-    comprimido = _gltfpack(tmp_c, movil, MOVIL_CARAS, caras, comprimir=True)
-    if not comprimido:
+    # Celular: menos caras y textura 2K, SIN compresión meshopt/cuantización: el visor de AR de Android (Scene Viewer)
+    # abre el archivo directo y no entiende esas extensiones; así el mismo archivo sirve en el menú y en AR.
+    comprimido = False
+    if not _gltfpack(tmp_c, movil, MOVIL_CARAS, caras, comprimir=False):
         shutil.copy(tmp_c, movil)
 
     mini = miniatura(usadas, cajas, inf, os.path.join(out, 'miniatura.jpg'))

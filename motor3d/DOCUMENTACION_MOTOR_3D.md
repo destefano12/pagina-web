@@ -4,6 +4,8 @@ Este documento explica el sistema que convierte fotos de un plato real en un mod
 
 Todo el software es gratuito y de código abierto. Lo único que puede costar plata es la máquina donde corre (ver **Costos**).
 
+**Hoy corre sin servidor propio y sin tarjeta:** el mismo motor (las mismas 13 etapas, el mismo control de calidad) se ejecuta en las máquinas de GitHub Actions, y la cola, los estados y los archivos viven en Supabase. Está explicado en la sección **7 bis**. El servidor con Docker de la sección 7 queda como opción para cuando haya volumen o se quiera una máquina dedicada.
+
 ---
 
 ## 1. Qué hace, en una línea por paso
@@ -35,7 +37,7 @@ Menú (Netlify) ─GET─/modelos/*┘                   └──────�
 | Almacenamiento | Fotos y resultados (privado), modelos publicados (lectura pública) | SeaweedFS (S3) | Apache-2.0 |
 | Reconstrucción | Ubica las cámaras y arma la nube de puntos | COLMAP 3.9 | BSD |
 | Malla y textura | Nube densa, superficie y textura con las fotos reales | OpenMVS 2.3 | AGPL-3.0 (sin modificar) |
-| Optimización | Reduce caras respetando la textura y comprime para celular | gltfpack (meshoptimizer) 0.24 | MIT |
+| Optimización | Reduce caras respetando la textura (costuras UV) | gltfpack (meshoptimizer) 0.24 | MIT |
 | HTTPS | Certificado automático y proxy | Caddy 2 | Apache-2.0 |
 | Visor y AR | 3D en la web, Scene Viewer (Android), Quick Look (iPhone) y WebXR | model-viewer | Apache-2.0 |
 
@@ -68,7 +70,7 @@ Menú (Netlify) ─GET─/modelos/*┘                   └──────�
 | 10 | Separar el plato | Recorte por la mesa y por el recuadro que marcó el restaurante |
 | 11 | Textura | `TextureMesh` con las fotos completas |
 | 12 | Limpieza y escala | Endereza el modelo y le pone el tamaño real según la medida cargada (nunca se inventa) |
-| 13 | Versiones | Maestra (≤ 600 mil caras, textura 4096) y celular (≤ 150 mil caras, 2048, comprimida, ≤ 15 MB), miniatura y validación de cada GLB |
+| 13 | Versiones | Maestra (≤ 600 mil caras, textura 4096) y celular (≤ 150 mil caras, textura 2048 en JPG, ≤ 15 MB, sin compresión meshopt para que la abra el visor de AR de Android), miniatura y validación de cada GLB |
 
 **Puntaje de calidad (0 a 100).** Suman puntos: el porcentaje de fotos ubicadas (20), el error de reproyección (10), la cobertura de ángulos (20), la superficie sin color (20), el detalle de forma, las piezas y los agujeros (20), y que las proporciones coincidan con las medidas cargadas (10).
 
@@ -132,6 +134,20 @@ Después, en `config.js` del sitio, poner `motorUrl: 'https://TU-DOMINIO/api'` y
 
 Oracle recupera las máquinas gratis que pasan 7 días casi sin uso. Con 2 núcleos un plato tarda bastante más que en una máquina de 4 núcleos. Esto es una **estimación, no está medido** en Oracle todavía.
 
+## 7 bis. Modo sin servidor: GitHub Actions + Supabase (el que está andando)
+
+No hace falta servidor, dominio ni tarjeta. El panel sigue con `motorUrl` vacío y usa este camino:
+
+1. El panel sube las fotos al bucket privado `escaneos` de Supabase y deja el escaneo en estado `pendiente`.
+2. La tarea `.github/workflows/nube3d.yml` (máquina Ubuntu de GitHub, 4 núcleos y 16 GB) toma el escaneo. Se identifica ante la función `nube` de Supabase con el token OIDC que firma GitHub, así que **no hay ninguna clave guardada en GitHub**.
+3. `nube3d/nube_github.py` corre `motor3d/app/motor/pipeline.reconstruir`, el mismo código que usa el worker de Docker: COLMAP 3.9.1 del paquete de Ubuntu, OpenMVS 2.3.0 (`herramientas/openmvs`), gltfpack 0.24 y las librerías de Python con las versiones de `docker/bloqueo-worker.txt`.
+4. Avisa el avance real (etapa N de 13 y porcentaje) en cada cambio de etapa y cada 8 segundos.
+5. Sube la versión para celular y la miniatura al bucket `modelos` y deja el escaneo en **`revision`** con puntaje, motivos, métricas y medidas medidas en el modelo. No se publica solo.
+6. En el panel, **Modelos 3D** muestra la lista con su estado. **Revisar** abre el modelo en 3D y AR. **Aprobar y publicar** llama a `aprobar_escaneo` (la base comprueba que sea del dueño, que haya pasado el control de calidad y que las medidas estén en rango) y recién ahí el plato queda con su modelo en el menú. También se puede **Reprocesar** con las mismas fotos, **Descartar** o **Quitar del menú**.
+7. Las fotos se borran solas cuando el modelo se publica o se descarta, o a los 7 días si nadie lo revisa.
+
+Límites de este modo: GitHub da 2.000 minutos por mes gratis en repositorios privados y sin límite en públicos. Cada tarea dura como máximo 6 horas. La versión maestra no se guarda, porque el plan gratis de Supabase acepta archivos de hasta 50 MB. Hay una tarea por vez, así que los escaneos se arman en fila.
+
 ## 8. GPU (opcional)
 
 Con una placa NVIDIA, `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` hace que COLMAP use la GPU para buscar y unir puntos (hace falta `nvidia-container-toolkit`).
@@ -157,6 +173,8 @@ Para que también OpenMVS use CUDA, se cambia `OpenMVS_USE_CUDA=ON` en `docker/w
 | Escáner del panel (18 paradas, revisión, rehacer una parada, subida) | navegador automático con cámara simulada | Pasa: 36 fotos más los recuadros, sin errores |
 | Rechazo por cobertura | dataset Monstree (41 fotos de un solo lado) | Rechazado bien: *"Faltaron fotos de atrás-izquierda (hueco de 267°)"* |
 
+**Resultado medido (25-nov-2026, Docker en una máquina de 4 núcleos sin GPU, dataset Buddha, 67 fotos):** pasó todo (`RESULTADO: TODO OK`). Tardó 32 minutos en total; la nube densa se llevó 16. Usó 65 de 67 fotos, las 65 quedaron ubicadas, con un error de reproyección de 0,34 px y los 12 sectores alrededor cubiertos. Puntaje **97/100**, aprobable. La versión celular pesa 1 MB (150 mil caras, textura 2048) y la maestra 15,7 MB (600 mil caras, textura 4096). Las medidas del modelo dieron 30 × 29,1 × 38,5 cm contra 30 × 25 × 35 cm cargadas, dentro de lo tolerado. Siguen pasando la seguridad, el link firmado alterado (403), la publicación con medidas y el bucket privado cerrado.
+
 **Pendiente, sin inventar resultados:** probar con comidas reales (hamburguesa, pizza, torta, ensalada, empanadas, pasta y postre). Eso necesita escaneos hechos con el teléfono en el restaurante.
 
 ## 11. Limitaciones conocidas
@@ -177,6 +195,7 @@ Para que también OpenMVS use CUDA, se cambia `OpenMVS_USE_CUDA=ON` en `docker/w
 | VPS de 4 núcleos y 16 GB (si no se usa Oracle) | **Pago**: más o menos 10 a 30 USD por mes |
 | Almacenamiento y transferencia | Gratis dentro del disco del servidor y de los 10 TB por mes de Oracle |
 | Netlify y Supabase (lo que ya existe) | Plan gratis actual, sin cambios |
+| Máquinas de GitHub Actions (modo sin servidor, sección 7 bis) | **Gratis**: sin límite de minutos en repositorios públicos |
 
 ## 13. Licencias
 

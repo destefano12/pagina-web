@@ -58,15 +58,95 @@ def bajar(url, destino):
             time.sleep(3)
 
 
-def subir(url, ruta):
+def subir(url, ruta, tipo='model/gltf-binary'):
     datos = open(ruta, 'rb').read()
-    req = urllib.request.Request(url, data=datos, method='PUT', headers={'Content-Type': 'model/gltf-binary', 'x-upsert': 'true'})
+    req = urllib.request.Request(url, data=datos, method='PUT', headers={'Content-Type': tipo, 'x-upsert': 'true'})
     with urllib.request.urlopen(req, timeout=300) as r:
         r.read()
 
 
+MOTOR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'motor3d', 'app')
+
+
+def _sin_detalle(metricas):
+    """Métricas para guardar en la plataforma: sin la lista foto por foto (pesa mucho y no hace falta para revisar)."""
+    m = {k: v for k, v in metricas.items() if k != 'fotos'}
+    return json.loads(json.dumps(m, default=float))
+
+
+def hacer_motor(r):
+    """Platos de los restaurantes: motor profesional (13 etapas, control de calidad). El modelo queda PARA REVISAR;
+    lo publica el restaurante desde el panel después de verlo y confirmar las medidas."""
+    if MOTOR not in sys.path:
+        sys.path.insert(0, MOTOR)
+    from motor.geometria import ErrorFoto
+    from motor.pipeline import Config, reconstruir
+    e = r['trabajo']; eid = e['id']
+    carpeta = os.path.join(TRABAJOS, eid); fotos = os.path.join(carpeta, 'fotos'); os.makedirs(fotos, exist_ok=True)
+    medidas = r.get('medidas') or {}
+    if not medidas and r.get('ancho_cm'):
+        medidas = {'ancho': float(r['ancho_cm']), 'prof': float(r['ancho_cm']), 'alto': 6.0}
+    print(f'\n== Plato {eid} (motor profesional): {len(r["fotos"])} fotos, medidas cargadas {medidas}', flush=True)
+    ultimo = [0.0, None]
+
+    def avisar(pct, num, total, texto):
+        cambio = ultimo[1] != num
+        if cambio:
+            print(f'  [{pct:3d}%] etapa {num}/{total}: {texto}', flush=True)
+        if cambio or time.time() - ultimo[0] > 8:
+            ultimo[0], ultimo[1] = time.time(), num
+            try:
+                nube('actualizar', id=eid, campos={'progreso': int(pct), 'etapa': texto, 'etapa_num': num, 'etapas_total': total})
+            except Exception as ex:
+                print('  (no pude avisar el progreso:', ex, ')', flush=True)
+
+    try:
+        avisar(0, 1, 13, 'Bajando las fotos')
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(lambda f: bajar(f['url'], os.path.join(fotos, f['nombre'])), r['fotos']))
+        cajas = None
+        if r.get('cajas'):
+            try:
+                with urllib.request.urlopen(r['cajas'], timeout=60) as cr:
+                    cajas = json.loads(cr.read())
+            except Exception as ex:
+                print('  (sin recuadros del objeto:', ex, ')', flush=True)
+        res = reconstruir(fotos, os.path.join(carpeta, 'trabajo'), medidas, avisar, cajas=cajas, cfg=Config.desde_entorno())
+        rutas = res['archivos']['rutas']
+        lugar = nube('lugar_modelo', id=eid)
+        subir(lugar['subir'], rutas['movil'])  # versión para celular (la que ve el cliente en el menú y en AR)
+        mini = False
+        if rutas.get('miniatura') and lugar.get('mini'):
+            try:
+                subir(lugar['mini']['subir'], rutas['miniatura'], 'image/jpeg'); mini = True
+            except Exception as ex:
+                print('  (no pude subir la miniatura:', ex, ')', flush=True)
+        metricas = _sin_detalle(res['metricas'] | {'archivos': {k: v for k, v in res['archivos'].items() if k != 'rutas'},
+                                                   'etapas': res['etapas']})
+        nube('revision', id=eid, camino=lugar['camino'], mini=mini, puntaje=res['puntaje'], aprobable=res['aprobable'],
+             motivos=res['motivos'], metricas=metricas, medidas=res['medidas_cm'])
+        print(f"  PARA REVISAR: puntaje {res['puntaje']}/100, aprobable={res['aprobable']}, medidas {res['medidas_cm']}", flush=True)
+        for m in res['motivos']:
+            print('   -', m, flush=True)
+    except ErrorFoto as ex:
+        print('  FALLÓ (fotos):', ex, flush=True)
+        nube('actualizar', id=eid, campos={'estado': 'fallo', 'etapa': 'No se pudo armar el modelo', 'error': str(ex)[:500]})
+    except Exception as ex:
+        traceback.print_exc()
+        reg = os.path.join(carpeta, 'trabajo', 'registro.log')
+        if os.path.exists(reg):
+            print(open(reg, encoding='utf-8', errors='replace').read()[-4000:])
+        nube('actualizar', id=eid, campos={'estado': 'fallo', 'etapa': 'Error técnico',
+                                           'error': 'Falló el proceso por un error técnico. Probá reprocesar.'})
+    finally:
+        shutil.rmtree(carpeta, ignore_errors=True)
+
+
 def hacer(r):
-    from fotogrametria import ErrorFoto, procesar  # se carga solo si hay trabajo
+    if r.get('cola', 'menu') == 'menu':
+        return hacer_motor(r)
+    from fotogrametria import ErrorFoto, procesar  # Metra 3D sigue con su proceso propio
     e = r['trabajo']; eid = e['id']
     cola = r.get('cola', 'menu'); modo = r.get('modo') or 'plato'
     carpeta = os.path.join(TRABAJOS, eid); fotos = os.path.join(carpeta, 'fotos'); os.makedirs(fotos, exist_ok=True)
