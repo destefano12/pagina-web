@@ -1,0 +1,60 @@
+name: Motor 3D · pruebas
+
+on:
+  push:
+    paths: ['motor3d/**', '.github/workflows/motor3d-ci.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unidad:
+    runs-on: ubuntu-24.04
+    defaults: { run: { working-directory: motor3d } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -r docker/requirements-worker.txt -c docker/bloqueo-worker.txt pytest
+      - run: python -m pytest -q tests/test_unidad.py
+
+  punta-a-punta:
+    needs: unidad
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    defaults: { run: { working-directory: motor3d } }
+    env:
+      ENV_FILE: tests/prueba.env
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Compilar imágenes (COLMAP + OpenMVS + gltfpack)
+        uses: docker/bake-action@v5
+        with:
+          workdir: motor3d
+          files: docker-compose.yml
+          targets: api,worker
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+      - name: Levantar todo en modo prueba
+        run: |
+          docker compose --env-file tests/prueba.env up -d --no-build --wait
+          curl -sf http://localhost/api/salud
+      - name: Fotos de prueba (Buddha de AliceVision, CC-BY 4.0, 67 fotos de un objeto sobre una mesa)
+        run: |
+          git clone --depth 1 https://github.com/alicevision/dataset_buddha.git /tmp/buddha
+          mkdir -p /tmp/fotos && cp /tmp/buddha/buddha/*.png /tmp/fotos/
+      - name: Escanear -> cola -> reconstrucción -> revisión -> publicación, por la API
+        run: |
+          pip install httpx pyjwt
+          mkdir -p /tmp/salida
+          SALIDA=/tmp/salida python tests/e2e_api.py /tmp/fotos
+      - name: Registros si algo falla
+        if: failure()
+        run: docker compose --env-file tests/prueba.env logs --tail 300 api worker
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: modelos-generados, path: /tmp/salida, if-no-files-found: ignore }

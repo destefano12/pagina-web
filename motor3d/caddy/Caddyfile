@@ -1,0 +1,28 @@
+# HTTPS automático (Let's Encrypt). DOMINIO puede ser propio o gratuito (ej. mimotor.duckdns.org).
+{$DOMINIO:localhost} {
+	encode zstd gzip
+
+	# modelos publicados: lectura pública directa del bucket, con caché larga
+	handle_path /modelos/* {
+		rewrite * /{$S3_BUCKET_PUBLICO:motor3d-modelos}{uri}
+		reverse_proxy almacen:8333
+		header Access-Control-Allow-Origin "*"
+		header Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	# la API del motor
+	handle_path /api/* {
+		request_body {
+			max_size 25MB
+		}
+		reverse_proxy api:8000
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	respond 404
+}

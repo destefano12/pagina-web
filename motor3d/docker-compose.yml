@@ -1,0 +1,78 @@
+# Motor 3D: todo autohospedado y de código abierto.
+#   docker compose up -d --build          (CPU)
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build   (con placa NVIDIA)
+name: motor3d
+
+x-comun: &comun
+  env_file: ${ENV_FILE:-.env}
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: "20m", max-file: "5" } }
+
+services:
+  postgres:
+    <<: *comun
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: motor3d
+      POSTGRES_USER: motor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD en .env}
+    volumes: [postgres:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U motor -d motor3d"], interval: 5s, retries: 20 }
+
+  redis:
+    <<: *comun
+    image: redis:7.2-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: [redis:/data]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 20 }
+
+  # almacenamiento S3 autohospedado: SeaweedFS (Apache-2.0). Bucket privado para fotos/trabajos, público solo lectura para modelos.
+  almacen:
+    <<: *comun
+    image: chrislusf/seaweedfs:3.97
+    entrypoint: ["/bin/sh", "/etc/motor3d/almacen.sh"]
+    volumes: [almacen:/data, ./docker/almacen.sh:/etc/motor3d/almacen.sh:ro]
+    healthcheck: { test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/cluster/status >/dev/null"], interval: 5s, retries: 30 }
+
+  api:
+    <<: *comun
+    build: { context: ., dockerfile: docker/api.Dockerfile }
+    image: motor3d-api
+    environment:
+      DATABASE_URL: postgresql://motor:${POSTGRES_PASSWORD}@postgres:5432/motor3d
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      almacen: { condition: service_healthy }
+
+  worker:
+    <<: *comun
+    build: { context: ., dockerfile: docker/worker.Dockerfile }
+    image: motor3d-worker
+    environment:
+      DATABASE_URL: postgresql://motor:${POSTGRES_PASSWORD}@postgres:5432/motor3d
+    volumes: [trabajos:/trabajos]
+    stop_grace_period: 60s
+    depends_on:
+      api: { condition: service_healthy }
+
+  # tareas de mantenimiento: limpieza diaria y vigilancia de trabajos trabados
+  mantenimiento:
+    <<: *comun
+    image: motor3d-worker
+    command: ["celery", "-A", "worker.tareas:celery_app", "worker", "-B", "-Q", "mantenimiento", "--concurrency", "1",
+              "-s", "/trabajos/celerybeat-schedule", "-l", "info"]
+    environment:
+      DATABASE_URL: postgresql://motor:${POSTGRES_PASSWORD}@postgres:5432/motor3d
+    volumes: [trabajos:/trabajos]
+    depends_on:
+      worker: { condition: service_started }
+
+  caddy:
+    <<: *comun
+    image: caddy:2.9-alpine
+    ports: ["80:80", "443:443"]
+    volumes: [./caddy/Caddyfile:/etc/caddy/Caddyfile:ro, caddy:/data]
+    depends_on: [api, almacen]
+
+volumes: { postgres: {}, redis: {}, almacen: {}, trabajos: {}, caddy: {} }

@@ -1,0 +1,11 @@
+# Variante con placa NVIDIA: COLMAP usa la GPU para puntos y emparejado (hace falta nvidia-container-toolkit).
+# OpenMVS se puede compilar con CUDA cambiando OpenMVS_USE_CUDA=ON en docker/worker.Dockerfile
+# y usando una imagen base nvidia/cuda (ver DOCUMENTACION_MOTOR_3D.md, sección GPU).
+services:
+  worker:
+    environment:
+      USAR_GPU: "1"
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
