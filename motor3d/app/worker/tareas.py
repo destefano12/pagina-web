@@ -200,4 +200,10 @@ def vigilar():
     trabados = db.todos("select id from trabajos where estado='procesando' and actualizado < now() - interval '30 minutes'")
     for t in trabados:
         _fallo_tecnico(t['id'], 'El proceso se detuvo sin terminar. Probá reprocesar.', 'sin avance por 30 minutos (vigilancia)')
-    return {'trabados': len(trabados)}
+    # en la cola pero sin tarea (la cola no respondió al enviarlo): se vuelve a encolar
+    huerfanos = db.todos("select id from trabajos where estado='en_cola' and tarea_celery is null and actualizado < now() - interval '5 minutes'")
+    for t in huerfanos:
+        r = reconstruir.apply_async(args=[str(t['id'])], queue='reconstruccion')
+        db.uno('update trabajos set tarea_celery=%s where id=%s', r.id, t['id'])
+        db.evento(t['id'], 'Vuelto a poner en la cola (vigilancia)', 'aviso')
+    return {'trabados': len(trabados), 'reencolados': len(huerfanos)}

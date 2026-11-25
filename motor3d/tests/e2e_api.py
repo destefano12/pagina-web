@@ -46,24 +46,26 @@ otro = str(uuid.uuid4())
 chequear('restaurante ajeno -> 403', c.post(f'{API}/v1/trabajos', headers=H, json={'restaurante_id': otro, 'plato_id': PID, 'medidas': {'ancho': 20, 'prof': 20, 'alto': 10}}).status_code == 403)
 chequear('medidas imposibles -> 422', c.post(f'{API}/v1/trabajos', headers=H, json={'restaurante_id': RID, 'plato_id': PID, 'medidas': {'ancho': 0, 'prof': 20, 'alto': 10}}).status_code == 422)
 
-# --- crear y subir ---
-r = c.post(f'{API}/v1/trabajos', headers=H, json={'restaurante_id': RID, 'plato_id': PID, 'medidas': {'ancho': 30, 'prof': 25, 'alto': 35}})
-chequear('crear trabajo', r.status_code == 201, r.text[:200])
-t = r.json(); tid = t['id']
-falsa = c.post(f'{API}/v1/trabajos/{tid}/fotos', headers=H, files=[('fotos', ('x.jpg', b'esto no es una foto', 'image/jpeg'))])
-chequear('archivo que no es imagen -> 415', falsa.status_code == 415)
-chequear('enviar sin fotos -> 422', c.post(f'{API}/v1/trabajos/{tid}/enviar', headers=H).status_code == 422)
+tid = os.environ.get('SEGUIR')  # para retomar el seguimiento de un trabajo ya enviado
+if not tid:
+    # --- crear y subir ---
+    r = c.post(f'{API}/v1/trabajos', headers=H, json={'restaurante_id': RID, 'plato_id': PID, 'medidas': {'ancho': 30, 'prof': 25, 'alto': 35}})
+    chequear('crear trabajo', r.status_code == 201, r.text[:200])
+    t = r.json(); tid = t['id']
+    falsa = c.post(f'{API}/v1/trabajos/{tid}/fotos', headers=H, files=[('fotos', ('x.jpg', b'esto no es una foto', 'image/jpeg'))])
+    chequear('archivo que no es imagen -> 415', falsa.status_code == 415)
+    chequear('enviar sin fotos -> 422', c.post(f'{API}/v1/trabajos/{tid}/enviar', headers=H).status_code == 422)
 
-carpeta = sys.argv[1]
-fotos = sorted(f for f in os.listdir(carpeta) if f.lower().endswith(('.jpg', '.jpeg', '.png')))
-for i in range(0, len(fotos), 5):
-    lote = [('fotos', (f, open(os.path.join(carpeta, f), 'rb').read(), 'image/png' if f.endswith('.png') else 'image/jpeg')) for f in fotos[i:i + 5]]
-    r = c.post(f'{API}/v1/trabajos/{tid}/fotos', headers=H, files=lote)
-    if r.status_code != 200:
-        chequear('subir fotos', False, r.text[:200]); sys.exit(1)
-print('fotos subidas:', r.json()['fotos_subidas'])
-r = c.post(f'{API}/v1/trabajos/{tid}/enviar', headers=H)
-chequear('enviar a la cola', r.status_code == 200 and r.json()['estado'] == 'en_cola', r.text[:200])
+    carpeta = sys.argv[1]
+    fotos = sorted(f for f in os.listdir(carpeta) if f.lower().endswith(('.jpg', '.jpeg', '.png')))
+    for i in range(0, len(fotos), 5):
+        lote = [('fotos', (f, open(os.path.join(carpeta, f), 'rb').read(), 'image/png' if f.endswith('.png') else 'image/jpeg')) for f in fotos[i:i + 5]]
+        r = c.post(f'{API}/v1/trabajos/{tid}/fotos', headers=H, files=lote)
+        if r.status_code != 200:
+            chequear('subir fotos', False, r.text[:200]); sys.exit(1)
+    print('fotos subidas:', r.json()['fotos_subidas'])
+    r = c.post(f'{API}/v1/trabajos/{tid}/enviar', headers=H)
+    chequear('enviar a la cola', r.status_code == 200 and r.json()['estado'] == 'en_cola', r.text[:200])
 
 # --- avance real ---
 t0, ult, vistos = time.time(), None, []
