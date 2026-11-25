@@ -163,6 +163,8 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     sp = os.path.join(dense, 'sparse')
     _run([colmap, 'model_converter', '--input_path', sp, '--output_path', sp, '--output_type', 'TXT'], trabajo, log)
     arriba = _arriba_camaras(os.path.join(sp, 'images.txt'))
+    if modo != 'ambiente':
+        arriba = _arriba_por_vuelta(sp, arriba)
 
     th = ['--max-threads', str(hilos)] if hilos else []
     avisar(39, 'Convirtiendo la escena')
@@ -338,6 +340,27 @@ def _hacia_donde_miran(sparse_dir):
         return None
 
 
+def _arriba_por_vuelta(sparse_dir, arriba):
+    """Otra forma de saber dónde es 'arriba': las fotos se sacan dando la vuelta al objeto, así que las cámaras
+    quedan más o menos sobre un plano horizontal; su normal es la vertical (apuntando hacia donde están las cámaras).
+    Si la vertical que dio el teléfono no coincide (fotos giradas, teléfono acostado), se usa esta."""
+    cm = _hacia_donde_miran(sparse_dir)
+    if cm is None:
+        return arriba
+    centro, cams = cm
+    c = cams - cams.mean(0)
+    _, sv, vt = np.linalg.svd(c, full_matrices=False)
+    if sv[2] > sv[1] * 0.6:  # las cámaras no forman una vuelta clara
+        return arriba
+    n = vt[2]
+    if (cams.mean(0) - centro) @ n < 0:
+        n = -n
+    if arriba is None or abs(n @ arriba) < 0.8:
+        print(f'  vertical: uso la de la vuelta de las fotos (la del teléfono {"no está" if arriba is None else "no coincide"})', file=sys.stderr)
+        return n
+    return arriba
+
+
 def _recortar_objeto(entrada, salida, arriba, cajas, sparse_dir):
     """Deja solo el objeto: saca la mesa (y todo lo que está debajo), lo que cae fuera del recuadro marcado
     y las cosas sueltas. Devuelve el plano de la mesa (n, d, tol) o None si no se pudo (se sigue con todo)."""
@@ -374,16 +397,40 @@ def _recortar_objeto(entrada, salida, arriba, cajas, sparse_dir):
             n = arriba; tol = np.ptp(base, axis=0).max() * 0.004; d = -np.percentile(base @ n, 1) - tol * 2.5
             print('  sin mesa clara: uso la base del objeto como piso', file=sys.stderr)
         dist = v @ n + d
-        if arriba is not None:
+        # de qué lado de la mesa está el objeto: del lado del punto al que apuntan todas las fotos
+        # (no depende de cómo se sostuvo el teléfono); si no se puede, se usa la vertical de las cámaras
+        cm = _hacia_donde_miran(sparse_dir) if sparse_dir else None
+        centro = cm[0] if cm is not None else None
+        if centro is not None and abs(centro @ n + d) > tol * 2:
+            if centro @ n + d < 0:
+                n, d, dist = -n, -d, -dist
+        elif arriba is not None:
             if n @ arriba < 0:
                 n, d, dist = -n, -d, -dist
         elif np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
             n, d, dist = -n, -d, -dist
-        ok = dist > tol * 2.5  # todo lo que está apoyado arriba de la mesa, sin la mesa
-        if dentro is not None:
-            ok &= dentro
-        caras = np.nonzero(ok[m.faces].all(axis=1))[0]
-        print(f'  objeto separado: {len(caras)} de {len(m.faces)} caras', file=sys.stderr)
+        sobre = dist > tol * 2.5  # todo lo que está apoyado arriba de la mesa, sin la mesa
+        cil = None
+        if centro is not None:
+            horiz = lambda x: x - np.outer(x @ n, n)
+            r_cam = np.median(np.linalg.norm(horiz(cm[1] - centro), axis=1))
+            cil = np.linalg.norm(horiz(v - centro), axis=1) < r_cam * 0.45
+        print(f'  puntos: {len(v)} · arriba de la mesa {sobre.sum()} · en el recuadro {"-" if dentro is None else dentro.sum()}'
+              f' · en el centro de la vuelta {"-" if cil is None else cil.sum()}', file=sys.stderr)
+        # se prueba de lo más preciso a lo más simple, y se usa la primera opción que deja un objeto razonable
+        opciones = []
+        if dentro is not None: opciones.append(('mesa + recuadro', sobre & dentro))
+        if cil is not None: opciones.append(('mesa + centro', sobre & cil))
+        if dentro is not None and cil is not None: opciones.append(('recuadro + centro', dentro & cil))
+        if cil is not None: opciones.append(('solo centro', cil))
+        opciones.append(('solo mesa', sobre))
+        minimo = max(300, int(len(m.faces) * 0.01))
+        caras = np.array([], int)
+        for nombre, ok in opciones:
+            caras = np.nonzero(ok[m.faces].all(axis=1))[0]
+            print(f'  objeto separado ({nombre}): {len(caras)} de {len(m.faces)} caras', file=sys.stderr)
+            if len(caras) >= minimo:
+                break
         if len(caras) < 300:
             return None
         sub = _quedarse_con_el_plato(m.submesh([caras], append=True), n)
