@@ -27,7 +27,7 @@ from .auth import Usuario, exigir_duenio, exigir_plato, publicar_en_menu, usuari
 Image.MAX_IMAGE_PIXELS = 60_000_000
 
 app = FastAPI(title='Motor 3D', version='1.0.0', docs_url='/docs', redoc_url=None)
-app.add_middleware(CORSMiddleware, allow_origins=config.ORIGENES_PERMITIDOS, allow_methods=['GET', 'POST', 'DELETE'],
+app.add_middleware(CORSMiddleware, allow_origins=config.ORIGENES_PERMITIDOS, allow_origin_regex=config.ORIGENES_PATRON, allow_methods=['GET', 'POST', 'DELETE'],
                    allow_headers=['Authorization', 'Content-Type'], max_age=3600)
 _r = redis.Redis.from_url(config.REDIS_URL)
 SECRETO = (os.environ.get('SECRETO_FIRMAS') or '').encode()

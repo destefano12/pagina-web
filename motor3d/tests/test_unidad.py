@@ -86,6 +86,7 @@ def test_lectura_de_avance():
     assert _fraccion_de('Processed file [5/50]', None) == pytest.approx(0.1)
     assert _fraccion_de('Matching block [1/2, 1/2]', None) == pytest.approx(0.25)
     ld = LectorDensa(10)
+    assert ld('Point-cloud composed of 35373 points with:') is None  # la nube inicial no cuenta
     assert ld('Selecting images for dense reconstruction completed: 4 images (1ms)') is None
     assert ld('Depth-map for image   3 estimated using  5 images: 1368x770 (10s)') == pytest.approx(0.85 / 4)
     assert ld('Point-cloud composed of 12345 points with:') == 1.0

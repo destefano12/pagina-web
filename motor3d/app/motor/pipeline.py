@@ -66,7 +66,8 @@ class Config:
     def desde_entorno(cls):
         e = os.environ.get
         return cls(colmap=e('COLMAP_BIN', 'colmap'), mvs_dir=e('MVS_DIR') or None, gpu=e('USAR_GPU', '0') == '1',
-                   hilos=int(e('HILOS', '0')), densa_max=int(e('DENSA_MAX', '1600')), textura_max=int(e('TEXTURA_MAX', '4096')))
+                   hilos=int(e('HILOS', '0')), densa_max=int(e('DENSA_MAX', '1600')), textura_max=int(e('TEXTURA_MAX', '4096')),
+                   limite_paso_s=int(e('LIMITE_PASO_S', str(3 * 3600))))
 
 
 class Avance:
@@ -134,7 +135,7 @@ class LectorDensa:
         if re.search(r'Depth-map for image\s+\d+ estimated', linea):
             self.hechos += 1
             return 0.85 * min(1.0, self.hechos / max(self.total or 1, 1))
-        if 'Point-cloud composed of' in linea:
+        if 'Point-cloud composed of' in linea and self.hechos:  # al principio también imprime la nube de puntos inicial
             return 1.0
         return None
 

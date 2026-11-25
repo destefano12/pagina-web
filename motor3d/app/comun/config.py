@@ -25,6 +25,8 @@ MODO_PRUEBA = _e('MODO_PRUEBA', '0') == '1'           # SOLO para pruebas autom�
 PRUEBA_SECRETO = _e('PRUEBA_SECRETO', '')
 
 ORIGENES_PERMITIDOS = [o.strip() for o in _e('ORIGENES_PERMITIDOS', 'http://localhost:8798').split(',') if o.strip()]
+# además de la lista: sitios que cumplan este patrón (por defecto, cualquier sitio de Netlify). La seguridad real es el token de sesión.
+ORIGENES_PATRON = _e('ORIGENES_PATRON', r'^https://[a-z0-9-]+\.netlify\.app$') or None
 
 # límites
 MAX_FOTOS = int(_e('MAX_FOTOS', '150'))
