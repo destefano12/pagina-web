@@ -310,6 +310,28 @@ def _dentro_de_cajas(v, cajas, sparse_dir, margen=0.08):
         return None
 
 
+def _hacia_donde_miran(sparse_dir):
+    """El objeto escaneado está donde apuntan todas las fotos: el punto más cercano a los ejes de todas las cámaras.
+    Devuelve (punto, centros de las cámaras) o None."""
+    try:
+        lineas = [l for l in open(os.path.join(sparse_dir, 'images.txt'), encoding='utf-8') if l.strip() and not l.startswith('#')]
+        A = np.zeros((3, 3)); b = np.zeros(3); centros = []
+        for l in lineas[0::2]:
+            p = l.split()
+            qw, qx, qy, qz = map(float, p[1:5]); t = np.array(list(map(float, p[5:8])))
+            Rm = np.array([[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                           [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                           [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
+            C = -Rm.T @ t; dvec = Rm.T @ np.array([0, 0, 1.0])
+            P = np.eye(3) - np.outer(dvec, dvec); A += P; b += P @ C; centros.append(C)
+        if len(centros) < 8:
+            return None
+        return np.linalg.solve(A, b), np.array(centros)
+    except Exception as e:
+        print('aviso centro:', e, file=sys.stderr)
+        return None
+
+
 def _recortar_objeto(entrada, salida, arriba, cajas, sparse_dir):
     """Deja solo el objeto: saca la mesa (y todo lo que está debajo), lo que cae fuera del recuadro marcado
     y las cosas sueltas. Devuelve el plano de la mesa (n, d, tol) o None si no se pudo (se sigue con todo)."""
@@ -321,6 +343,19 @@ def _recortar_objeto(entrada, salida, arriba, cajas, sparse_dir):
         # (si no, en un objeto alto como una botella el "plano más grande" puede ser su costado o una pared)
         res = _plano_ransac(muestra, iters=1500, eje=arriba, minimo=0.94) if arriba is not None else _plano_ransac(muestra)
         dentro = _dentro_de_cajas(v, cajas, sparse_dir) if (cajas and sparse_dir) else None
+        if dentro is None and sparse_dir and arriba is not None:
+            # sin recuadro marcado: el objeto es lo que está en el centro de la vuelta que se dio con el teléfono.
+            # Se deja un cilindro vertical alrededor de ese centro (saca paredes, telas y cosas del fondo)
+            cm = _hacia_donde_miran(sparse_dir)
+            if cm is not None:
+                centro, camaras = cm
+                horiz = lambda x: x - np.outer(x @ arriba, arriba) if x.ndim == 2 else x - (x @ arriba) * arriba
+                r_cam = np.median(np.linalg.norm(horiz(camaras - centro), axis=1))
+                radio = r_cam * 0.45
+                dentro = np.linalg.norm(horiz(v - centro), axis=1) < radio
+                print(f'  sin recuadro: me quedo con lo que está en el centro de la vuelta ({dentro.sum()} de {len(v)} puntos)', file=sys.stderr)
+                if dentro.sum() < 500:
+                    dentro = None
         if res is not None:
             n, d, tol = res
             if np.count_nonzero(np.abs(muestra @ n + d) < tol) < len(muestra) * 0.03:
