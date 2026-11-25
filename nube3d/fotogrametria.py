@@ -96,13 +96,14 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     E = 'Buscando puntos en las fotos'; avisar(8, E)
     _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
           '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
-          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(TAM),
-          '--SiftExtraction.max_num_features', '12000'], trabajo, log, (avisar, 8, 18, 120 * k, E))
+          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(min(TAM, 2400)),
+          '--SiftExtraction.max_num_features', '8192', '--SiftExtraction.num_threads', '2'], trabajo, log, (avisar, 8, 18, 120 * k, E))
     E = 'Uniendo las fotos entre sí'; avisar(18, E)
     _run([colmap, 'exhaustive_matcher', '--database_path', db, '--SiftMatching.use_gpu', g,
           '--SiftMatching.guided_matching', '1', '--SiftMatching.max_num_matches', '16384',
           '--SiftMatching.num_threads', '2', '--ExhaustiveMatching.block_size', '20'], trabajo, log, (avisar, 18, 30, 400 * k, E))
-    # (con fotos 4K y todos los núcleos, la memoria se llenaba y GitHub apagaba la máquina)
+    # (con fotos 4K y todos los núcleos, la memoria se llenaba y GitHub apagaba la máquina: para unir las fotos
+    #  alcanza con 2400 px; la textura se pinta igual con las fotos completas de 4096 px)
     E = 'Calculando dónde estaba la cámara'; avisar(30, E)
     _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log, (avisar, 30, 38, 250 * k, E))
     modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
