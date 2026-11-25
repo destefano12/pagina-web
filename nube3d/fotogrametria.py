@@ -47,7 +47,11 @@ def _run(cmd, cwd, log, avance=None, limite=None):
         def latir():
             t0 = time.time(); ultimo = desde
             while not listo.wait(8):
-                pct = int(desde + (hasta - 1 - desde) * (1 - math.exp(-(time.time() - t0) / seg)))
+                # avanza parejo con el tiempo esperado del paso (así el % y los minutos que faltan son reales);
+                # si el paso tarda más de lo previsto, sigue subiendo cada vez más despacio sin llegar al final
+                x = (time.time() - t0) / seg
+                frac = x if x < 0.9 else 0.9 + 0.1 * (1 - math.exp(-(x - 0.9) * 3))
+                pct = int(desde + (hasta - 1 - desde) * frac)
                 if pct > ultimo:
                     ultimo = pct; avisar(pct, etapa)
         threading.Thread(target=latir, daemon=True).start()
@@ -120,27 +124,27 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     db = os.path.join(trabajo, 'db.db')
     sparse = os.path.join(trabajo, 'sparse'); os.makedirs(sparse, exist_ok=True)
 
-    E = 'Buscando puntos en las fotos'; avisar(8, E)
+    E = 'Buscando puntos en las fotos'; avisar(3, E)
     _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
           '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
-          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(min(TAM, 3200)),
-          '--SiftExtraction.max_num_features', '10000', '--SiftExtraction.num_threads', '2'], trabajo, log, (avisar, 8, 18, 120 * k, E))
-    E = 'Uniendo las fotos entre sí'; avisar(18, E)
+          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(min(TAM, 2400)),
+          '--SiftExtraction.max_num_features', '8000', '--SiftExtraction.num_threads', '4'], trabajo, log, (avisar, 3, 11, 90 * k, E))
+    E = 'Uniendo las fotos entre sí'; avisar(11, E)
     # todas contra todas (mejor calidad). Si se cuelga, se corta a los 15 min y se usa el orden en que
     # se sacaron las fotos (cada una con las 15 siguientes), que es mucho más liviano
-    base = [colmap, None, '--database_path', db, '--SiftMatching.use_gpu', g, '--SiftMatching.max_num_matches', '10000', '--SiftMatching.num_threads', '2']
+    base = [colmap, None, '--database_path', db, '--SiftMatching.use_gpu', g, '--SiftMatching.max_num_matches', '8000', '--SiftMatching.num_threads', '4']
     try:
         _run([base[0], 'exhaustive_matcher', *base[2:], '--ExhaustiveMatching.block_size', '10'],
-             trabajo, log, (avisar, 18, 30, 400 * k, E), limite=900)
+             trabajo, log, (avisar, 11, 33, 240 * k, E), limite=900)
     except RuntimeError as ex:
         print('  aviso:', ex, '-> pruebo uniendo en orden', flush=True)
         base[base.index('--SiftMatching.num_threads') + 1] = '1'
         _run([base[0], 'sequential_matcher', *base[2:], '--SequentialMatching.overlap', '15', '--SequentialMatching.quadratic_overlap', '1'],
-             trabajo, log, (avisar, 24, 30, 200 * k, E), limite=1200)
+             trabajo, log, (avisar, 22, 33, 150 * k, E), limite=1200)
     # (con fotos 4K y todos los núcleos, la memoria se llenaba y GitHub apagaba la máquina: para unir las fotos
     #  alcanza con 3200 px; la textura se pinta igual con las fotos completas de 4096 px)
-    E = 'Calculando dónde estaba la cámara'; avisar(30, E)
-    _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log, (avisar, 30, 38, 250 * k, E))
+    E = 'Calculando dónde estaba la cámara'; avisar(33, E)
+    _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log, (avisar, 33, 37, 40 * k, E))
     modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
     if not modelos:
         raise ErrorFoto('No se pudieron unir las fotos. Sacalas con más luz, sin moverte rápido y dando la vuelta completa.')
@@ -151,36 +155,38 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
         raise ErrorFoto(f'Solo se pudieron usar {reg} de {len(fotos)} fotos: el objeto tiene muy poco detalle o brilla mucho. '
                         'Probá con algo con más textura (comida, madera, tela), luz pareja sin reflejos y la mesa con textura.')
 
-    E = 'Preparando las fotos'; avisar(38, E)
+    E = 'Preparando las fotos'; avisar(37, E)
     dense = os.path.join(trabajo, 'dense')
     _run([colmap, 'image_undistorter', '--image_path', fotos_dir, '--input_path', mejor, '--output_path', dense,
-          '--output_type', 'COLMAP', '--max_image_size', str(TAM)], trabajo, log, (avisar, 38, 44, 40 * k, E))
+          '--output_type', 'COLMAP', '--max_image_size', str(TAM)], trabajo, log, (avisar, 37, 39, 20 * k, E))
     # OpenMVS espera los parámetros de cámara en texto
     sp = os.path.join(dense, 'sparse')
     _run([colmap, 'model_converter', '--input_path', sp, '--output_path', sp, '--output_type', 'TXT'], trabajo, log)
     arriba = _arriba_camaras(os.path.join(sp, 'images.txt'))
 
     th = ['--max-threads', str(hilos)] if hilos else []
-    avisar(45, 'Convirtiendo la escena')
+    avisar(39, 'Convirtiendo la escena')
     _run([mvs('InterfaceCOLMAP'), '-i', dense, '-o', 'escena.mvs', '--image-folder', os.path.join(dense, 'images'), '-v', '1'], trabajo, log)
-    E = 'Armando la nube de puntos densa (es lo que más tarda)'; avisar(52, E)
-    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '1024', '--max-resolution', '1800', '-v', '1', *th], trabajo, log, (avisar, 52, 75, 900 * k, E))
-    E = 'Creando la superficie'; avisar(75, E)
-    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '--close-holes', '300' if modo != 'ambiente' else '30', '-v', '1', *th], trabajo, log, (avisar, 75, 85, 120 * k, E))
+    E = 'Armando la forma del objeto'; avisar(40, E)
+    # la forma se calcula a 1400 px (rápido); los colores se pintan después con las fotos completas en 4K
+    _run([mvs('DensifyPointCloud'), 'escena.mvs', '--resolution-level', str(NIVEL), '--min-resolution', '800', '--max-resolution', '1400',
+          '--geometric-iters', '1', '-v', '1', *th], trabajo, log, (avisar, 40, 82, 420 * k, E))
+    E = 'Creando la superficie'; avisar(82, E)
+    _run([mvs('ReconstructMesh'), 'escena_dense.mvs', '-p', 'escena_dense.ply', '--close-holes', '300' if modo != 'ambiente' else '30', '-v', '1', *th], trabajo, log, (avisar, 82, 90, 80 * k, E))
     malla, plano = 'escena_dense_mesh.ply', None
     if modo != 'ambiente':
-        avisar(84, 'Separando el objeto de la mesa y del fondo')
+        avisar(90, 'Separando el objeto de la mesa y del fondo')
         plano = _recortar_objeto(os.path.join(trabajo, 'escena_dense_mesh.ply'), os.path.join(trabajo, 'objeto.ply'), arriba, cajas, sp)
         if plano is not None:
             malla = 'objeto.ply'
-    E = 'Pintando la textura en 4K'; avisar(85, E)
+    E = 'Pintando la textura en 4K'; avisar(91, E)
     _run([mvs('TextureMesh'), 'escena_dense.mvs', '-m', malla, '--decimate', '1',
-          '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log, (avisar, 85, 94, 180 * k, E))
+          '--max-texture-size', '4096', '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '1', *th], trabajo, log, (avisar, 91, 96, 40 * k, E))
     crudo = os.path.join(trabajo, 'escena_textura.glb')
     if not os.path.exists(crudo):
         raise RuntimeError('OpenMVS no generó el modelo con textura')
 
-    avisar(94, 'Recortando la mesa y ajustando el tamaño real' if modo != 'ambiente' else 'Enderezando el ambiente y midiendo')
+    avisar(96, 'Recortando la mesa y ajustando el tamaño real' if modo != 'ambiente' else 'Enderezando el ambiente y midiendo')
     final = os.path.join(trabajo, 'modelo.glb' if modo != 'plato' else 'plato.glb')
     dims = limpiar(crudo, final, ancho_cm, modo=modo, arriba=arriba, cajas=None if plano is not None else cajas, sparse_dir=os.path.join(dense, 'sparse'), plano=plano)
     import json as _json

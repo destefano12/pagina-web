@@ -83,9 +83,10 @@ def hacer(r):
                 print('  (no pude avisar el progreso:', ex, ')', flush=True)
 
     try:
-        avisar(3, 'Bajando las fotos')
-        for f in r['fotos']:
-            bajar(f['url'], os.path.join(fotos, f['nombre']))
+        avisar(1, 'Bajando las fotos')
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(8) as ex:  # de a 8 a la vez: 45 fotos 4K en segundos
+            list(ex.map(lambda f: bajar(f['url'], os.path.join(fotos, f['nombre'])), r['fotos']))
         ancho = float(r['ancho_cm']) if r.get('ancho_cm') else None
         cajas = None
         if r.get('cajas'):  # recuadro del objeto marcado en la cámara, foto por foto
