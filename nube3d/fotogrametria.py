@@ -174,7 +174,7 @@ def _arriba_camaras(images_txt):
         return None
 
 
-def _plano_ransac(v, iters=600, tol=None, rng=np.random.default_rng(7)):
+def _plano_ransac(v, iters=600, tol=None, rng=np.random.default_rng(7), eje=None, minimo=0.0):
     ext = np.ptp(v, axis=0).max()
     tol = tol or ext * 0.004
     best, best_n = None, -1
@@ -183,8 +183,11 @@ def _plano_ransac(v, iters=600, tol=None, rng=np.random.default_rng(7)):
         n = np.cross(b - a, c - a); ln = np.linalg.norm(n)
         if ln < 1e-12: continue
         n /= ln; d = -n @ a
+        if eje is not None and abs(n @ eje) < minimo: continue  # solo planos casi horizontales (la mesa)
         cnt = np.count_nonzero(np.abs(v @ n + d) < tol)
         if cnt > best_n: best, best_n = (n, d), cnt
+    if best is None:
+        return None
     n, d = best
     # ajuste fino por mínimos cuadrados con los inliers
     ins = v[np.abs(v @ n + d) < tol]
@@ -275,18 +278,31 @@ def _recortar_objeto(entrada, salida, arriba, cajas, sparse_dir):
     try:
         m = trimesh.load(entrada, process=False)
         v = m.vertices
-        n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
+        muestra = v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)]
+        # la mesa tiene que ser horizontal: con la vertical que dan las cámaras, solo se aceptan planos casi horizontales
+        # (si no, en un objeto alto como una botella el "plano más grande" puede ser su costado o una pared)
+        res = _plano_ransac(muestra, iters=1500, eje=arriba, minimo=0.94) if arriba is not None else _plano_ransac(muestra)
+        dentro = _dentro_de_cajas(v, cajas, sparse_dir) if (cajas and sparse_dir) else None
+        if res is not None:
+            n, d, tol = res
+            if np.count_nonzero(np.abs(muestra @ n + d) < tol) < len(muestra) * 0.03:
+                res = None  # casi no hay mesa reconstruida
+        if res is None:
+            if arriba is None:
+                return None
+            # sin mesa visible: el piso es la base del objeto marcado
+            base = v[dentro] if dentro is not None and dentro.sum() > 500 else v
+            n = arriba; tol = np.ptp(base, axis=0).max() * 0.004; d = -np.percentile(base @ n, 1) - tol * 2.5
+            print('  sin mesa clara: uso la base del objeto como piso', file=sys.stderr)
         dist = v @ n + d
-        if arriba is not None and abs(n @ arriba) > 0.5:
+        if arriba is not None:
             if n @ arriba < 0:
                 n, d, dist = -n, -d, -dist
         elif np.count_nonzero(dist > tol * 3) < np.count_nonzero(dist < -tol * 3):
             n, d, dist = -n, -d, -dist
         ok = dist > tol * 2.5  # todo lo que está apoyado arriba de la mesa, sin la mesa
-        if cajas and sparse_dir:
-            dentro = _dentro_de_cajas(v, cajas, sparse_dir)
-            if dentro is not None:
-                ok &= dentro
+        if dentro is not None:
+            ok &= dentro
         caras = np.nonzero(ok[m.faces].all(axis=1))[0]
         print(f'  objeto separado: {len(caras)} de {len(m.faces)} caras', file=sys.stderr)
         if len(caras) < 300:
@@ -323,7 +339,9 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=No
         n, d, tol = plano
         dist = v @ n + d
     else:
-        n, d, tol = _plano_ransac(v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)])
+        mu = v[np.random.default_rng(1).choice(len(v), min(len(v), 60000), replace=False)]
+        res = _plano_ransac(mu, iters=1500, eje=arriba, minimo=0.94) if arriba is not None else None
+        n, d, tol = res if res is not None else _plano_ransac(mu)
         dist = v @ n + d
     # el plato queda del lado del plano donde hay más volumen
     if plano is not None:
