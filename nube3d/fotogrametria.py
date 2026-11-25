@@ -37,7 +37,7 @@ def _bin(carpeta, nombre):
     return found
 
 
-def _run(cmd, cwd, log, avance=None):
+def _run(cmd, cwd, log, avance=None, limite=None):
     """avance = (avisar, desde, hasta, segundos_estimados, etapa): mientras corre el paso, el % sigue
     subiendo despacio hacia `hasta` (sin llegar), así la barra nunca se queda quieta."""
     log.write('\n$ ' + ' '.join(map(str, cmd)) + '\n'); log.flush()
@@ -52,7 +52,9 @@ def _run(cmd, cwd, log, avance=None):
                     ultimo = pct; avisar(pct, etapa)
         threading.Thread(target=latir, daemon=True).start()
     try:
-        p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+        p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT, timeout=limite)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'{os.path.basename(str(cmd[0]))} {cmd[1] if len(cmd) > 1 else ""} tardó más de {int(limite // 60)} min y se cortó')
     finally:
         listo.set()
     if p.returncode != 0:
@@ -96,14 +98,21 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     E = 'Buscando puntos en las fotos'; avisar(8, E)
     _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
           '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
-          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(min(TAM, 2400)),
-          '--SiftExtraction.max_num_features', '8192', '--SiftExtraction.num_threads', '2'], trabajo, log, (avisar, 8, 18, 120 * k, E))
+          '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(min(TAM, 3200)),
+          '--SiftExtraction.max_num_features', '12000', '--SiftExtraction.num_threads', '2'], trabajo, log, (avisar, 8, 18, 120 * k, E))
     E = 'Uniendo las fotos entre sí'; avisar(18, E)
-    _run([colmap, 'exhaustive_matcher', '--database_path', db, '--SiftMatching.use_gpu', g,
-          '--SiftMatching.guided_matching', '1', '--SiftMatching.max_num_matches', '16384',
-          '--SiftMatching.num_threads', '2', '--ExhaustiveMatching.block_size', '20'], trabajo, log, (avisar, 18, 30, 400 * k, E))
+    # todas contra todas (mejor calidad). Si se cuelga, se corta a los 15 min y se usa el orden en que
+    # se sacaron las fotos (cada una con las 15 siguientes), que es mucho más liviano
+    base = [colmap, None, '--database_path', db, '--SiftMatching.use_gpu', g, '--SiftMatching.max_num_matches', '16384', '--SiftMatching.num_threads', '2']
+    try:
+        _run([base[0], 'exhaustive_matcher', *base[2:], '--SiftMatching.guided_matching', '1', '--ExhaustiveMatching.block_size', '20'],
+             trabajo, log, (avisar, 18, 30, 400 * k, E), limite=900)
+    except RuntimeError as ex:
+        print('  aviso:', ex, '-> pruebo uniendo en orden', flush=True)
+        _run([base[0], 'sequential_matcher', *base[2:], '--SequentialMatching.overlap', '15', '--SequentialMatching.quadratic_overlap', '1'],
+             trabajo, log, (avisar, 24, 30, 200 * k, E), limite=1200)
     # (con fotos 4K y todos los núcleos, la memoria se llenaba y GitHub apagaba la máquina: para unir las fotos
-    #  alcanza con 2400 px; la textura se pinta igual con las fotos completas de 4096 px)
+    #  alcanza con 3200 px; la textura se pinta igual con las fotos completas de 4096 px)
     E = 'Calculando dónde estaba la cámara'; avisar(30, E)
     _run([colmap, 'mapper', '--database_path', db, '--image_path', fotos_dir, '--output_path', sparse], trabajo, log, (avisar, 30, 38, 250 * k, E))
     modelos = [d for d in glob.glob(os.path.join(sparse, '*')) if os.path.isdir(d)]
