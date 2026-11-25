@@ -51,14 +51,39 @@ def _run(cmd, cwd, log, avance=None, limite=None):
                 if pct > ultimo:
                     ultimo = pct; avisar(pct, etapa)
         threading.Thread(target=latir, daemon=True).start()
+    nombre = f'{os.path.basename(str(cmd[0]))} {cmd[1] if len(cmd) > 1 else ""}'
+    p = subprocess.Popen([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
+    t0, motivo, visto = time.time(), None, 0
     try:
-        p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=log, stderr=subprocess.STDOUT, timeout=limite)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f'{os.path.basename(str(cmd[0]))} {cmd[1] if len(cmd) > 1 else ""} tardó más de {int(limite // 60)} min y se cortó')
+        # guardián: si la máquina se queda sin memoria, GitHub la apaga entera y se pierde todo.
+        # Antes de que pase, cortamos este programa solo, y el paso siguiente prueba algo más liviano.
+        while p.poll() is None:
+            time.sleep(2)
+            libre = _memoria_libre_mb()
+            if time.time() - visto > 30:
+                visto = time.time(); print(f'    · {nombre.strip()}: {int(time.time() - t0)} s, memoria libre {libre} MB', flush=True)
+            if libre is not None and libre < 1500:
+                motivo = f'{nombre.strip()} se estaba quedando sin memoria (quedaban {libre} MB) y se cortó'
+            elif limite and time.time() - t0 > limite:
+                motivo = f'{nombre.strip()} tardó más de {int(limite // 60)} min y se cortó'
+            if motivo:
+                p.kill(); p.wait()
+                raise RuntimeError(motivo)
     finally:
         listo.set()
+        if p.poll() is None:
+            p.kill()
     if p.returncode != 0:
         raise RuntimeError(f'Falló {os.path.basename(str(cmd[0]))} (código {p.returncode}). Ver registro.log')
+
+
+def _memoria_libre_mb():
+    try:
+        for l in open('/proc/meminfo'):
+            if l.startswith('MemAvailable:'):
+                return int(l.split()[1]) // 1024
+    except Exception:
+        return None
 
 
 # calidad: tamaño de foto que usa la nube y nivel de detalle de la nube densa (0 = máximo)
@@ -99,16 +124,17 @@ def procesar(fotos_dir, trabajo, ancho_cm, avisar=lambda pct, etapa: None, colma
     _run([colmap, 'feature_extractor', '--database_path', db, '--image_path', fotos_dir,
           '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'SIMPLE_RADIAL',
           '--SiftExtraction.use_gpu', g, '--SiftExtraction.max_image_size', str(min(TAM, 3200)),
-          '--SiftExtraction.max_num_features', '12000', '--SiftExtraction.num_threads', '2'], trabajo, log, (avisar, 8, 18, 120 * k, E))
+          '--SiftExtraction.max_num_features', '10000', '--SiftExtraction.num_threads', '2'], trabajo, log, (avisar, 8, 18, 120 * k, E))
     E = 'Uniendo las fotos entre sí'; avisar(18, E)
     # todas contra todas (mejor calidad). Si se cuelga, se corta a los 15 min y se usa el orden en que
     # se sacaron las fotos (cada una con las 15 siguientes), que es mucho más liviano
-    base = [colmap, None, '--database_path', db, '--SiftMatching.use_gpu', g, '--SiftMatching.max_num_matches', '16384', '--SiftMatching.num_threads', '2']
+    base = [colmap, None, '--database_path', db, '--SiftMatching.use_gpu', g, '--SiftMatching.max_num_matches', '10000', '--SiftMatching.num_threads', '2']
     try:
-        _run([base[0], 'exhaustive_matcher', *base[2:], '--SiftMatching.guided_matching', '1', '--ExhaustiveMatching.block_size', '20'],
+        _run([base[0], 'exhaustive_matcher', *base[2:], '--ExhaustiveMatching.block_size', '10'],
              trabajo, log, (avisar, 18, 30, 400 * k, E), limite=900)
     except RuntimeError as ex:
         print('  aviso:', ex, '-> pruebo uniendo en orden', flush=True)
+        base[base.index('--SiftMatching.num_threads') + 1] = '1'
         _run([base[0], 'sequential_matcher', *base[2:], '--SequentialMatching.overlap', '15', '--SequentialMatching.quadratic_overlap', '1'],
              trabajo, log, (avisar, 24, 30, 200 * k, E), limite=1200)
     # (con fotos 4K y todos los núcleos, la memoria se llenaba y GitHub apagaba la máquina: para unir las fotos
