@@ -15,9 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (opcional) certificado extra si la red pasa por un proxy que inspecciona HTTPS: docker build --secret id=ca,src=ca.crt
 RUN --mount=type=secret,id=ca,required=false if [ -s /run/secrets/ca ]; then cp /run/secrets/ca /usr/local/share/ca-certificates/extra.crt && update-ca-certificates; fi
 RUN git clone --depth 1 https://github.com/cdcseacave/VCG.git /vcglib \
- && git clone --depth 1 --branch ${OPENMVS_VERSION} --recurse-submodules https://github.com/cdcseacave/openMVS.git /openmvs \
+ && git clone --depth 1 --branch ${OPENMVS_VERSION} https://github.com/cdcseacave/openMVS.git /openmvs \
  && cmake -S /openmvs -B /b-mvs -G Ninja -DCMAKE_BUILD_TYPE=Release -DVCG_ROOT=/vcglib \
       -DOpenMVS_USE_CUDA=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_BUILD_VIEWER=OFF -DOpenMVS_USE_BREAKPAD=OFF \
+      -DCMAKE_CXX_FLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" -DCMAKE_C_FLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" \
       -DCMAKE_INSTALL_PREFIX=/opt/openmvs \
  && cmake --build /b-mvs \
  && cmake --install /b-mvs
