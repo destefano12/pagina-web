@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-from . import calidad, exportar, validacion
+from . import brillos, calidad, exportar, validacion
 from .geometria import (ErrorFoto, _arriba_camaras, _arriba_por_vuelta, _bin, _memoria_libre_mb, _recortar_objeto, limpiar)
 
 # Etapas: (nombre visible, peso en el total). Los pesos salen de tiempos medidos en CPU de 4 núcleos.
@@ -244,7 +244,10 @@ def reconstruir(fotos_dir: str, trabajo: str, dims_cm: dict, avisar, cancelado=l
     for n in inf.usadas:
         dst = os.path.join(usadas, n)
         if not os.path.exists(dst):
-            os.link(os.path.join(fotos_dir, n), dst) if hasattr(os, 'link') else shutil.copy(os.path.join(fotos_dir, n), dst)
+            try:
+                os.link(os.path.join(fotos_dir, n), dst)
+            except OSError:  # otro disco o sistema sin enlaces: se copia
+                shutil.copy(os.path.join(fotos_dir, n), dst)
     n_fotos = len(inf.usadas)
     metricas['fotos_usadas'] = n_fotos
 
@@ -318,12 +321,35 @@ def reconstruir(fotos_dir: str, trabajo: str, dims_cm: dict, avisar, cancelado=l
 
     # 11) textura en alta resolución (con las fotos completas)
     av.entrar(11)
-    correr([mvs('TextureMesh'), 'escena_dense.mvs', '-m', malla, '--decimate', '1', '--max-texture-size', str(cfg.textura_max),
-            '--export-type', 'glb', '-o', 'escena_textura.glb', '-v', '2', *th], trabajo, log, av, limite=cfg.limite_paso_s,
-           lector=lambda l: None)
-    crudo = os.path.join(trabajo, 'escena_textura.glb')
-    if not os.path.exists(crudo):
-        raise RuntimeError('OpenMVS no generó el modelo con textura')
+    # sin reflejos: cada parte se pinta con las fotos donde esa parte no brilla (ver brillos.py)
+    imgs = os.path.join(dense, 'images')
+    try:
+        metricas['brillos'] = brillos.marcar(imgs)
+    except Exception as ex:
+        metricas['brillos'] = {'error': str(ex)[:200]}
+        brillos.borrar(imgs)
+
+    def texturizar(salida, con_mascaras):
+        correr([mvs('TextureMesh'), 'escena_dense.mvs', '-m', malla, '--decimate', '1', '--max-texture-size', str(cfg.textura_max),
+                *(['--ignore-mask-label', str(brillos.ETIQUETA)] if con_mascaras else []),
+                '--export-type', 'glb', '-o', salida, '-v', '2', *th], trabajo, log, av, limite=cfg.limite_paso_s,
+               lector=lambda l: None)
+        ruta = os.path.join(trabajo, salida)
+        if not os.path.exists(ruta):
+            raise RuntimeError('OpenMVS no generó el modelo con textura')
+        return ruta
+
+    crudo = texturizar('escena_textura.glb', 'error' not in metricas['brillos'])
+    if 'error' not in metricas['brillos']:
+        # si al sacar los brillos alguna parte quedó sin ninguna foto que la vea, se vuelve a pintar sin máscaras
+        vacia = calidad.textura_vacia(trimesh.load(crudo, force='mesh')) or 0.0
+        metricas['brillos']['textura_vacia_con_mascaras'] = round(vacia, 4)
+        if vacia > 0.005:
+            brillos.borrar(imgs)
+            crudo = texturizar('escena_textura_sin_mascaras.glb', False)
+            metricas['brillos']['usadas'] = False
+        else:
+            metricas['brillos']['usadas'] = True
 
     # 12) limpieza, enderezado y escala real (con la medida que cargó el restaurante)
     av.entrar(12)

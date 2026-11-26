@@ -500,6 +500,12 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=No
     # sin medida real: se deja a 1 m de lado mayor y se avisa que no tiene escala
     k = ((float(ancho_cm) / 100.0) if ancho_cm else 1.0) / max(ancho, 1e-9)
     sub.apply_scale(k)
+    # 5 bis) base cerrada: el plato apoyado nunca se ve desde abajo; se tapa con una base plana del color del borde
+    if modo == 'plato':
+        try:
+            sub = cerrar_base(sub)
+        except Exception as e:
+            print('aviso base:', e, file=sys.stderr)
     # 6) aliviar: menos caras y textura en JPG
     if len(sub.faces) > max_caras:
         try:
@@ -521,6 +527,88 @@ def limpiar(entrada, salida, ancho_cm, max_caras=250000, modo='plato', arriba=No
         print('aviso textura:', e, file=sys.stderr)
     sub.export(salida)
     return _medidas(sub, bool(ancho_cm))
+
+
+def _parche_libre(img: Image.Image, uv: np.ndarray, faces: np.ndarray, lado: int = 16):
+    """Busca una esquina de la textura que ninguna cara use, para pintar ahí el color de la base."""
+    w, h = img.size
+    px = np.c_[(uv[:, 0] % 1) * w, (1 - uv[:, 1] % 1) * h]
+    tri = px[faces]
+    lo, hi = tri.min(axis=1), tri.max(axis=1)
+    for x0, y0 in ((w - lado, h - lado), (0, h - lado), (w - lado, 0), (0, 0)):
+        x1, y1 = x0 + lado, y0 + lado
+        usa = (hi[:, 0] >= x0 - 2) & (lo[:, 0] <= x1 + 2) & (hi[:, 1] >= y0 - 2) & (lo[:, 1] <= y1 + 2)
+        if not usa.any():
+            return x0, y0
+    return None
+
+
+def cerrar_base(m: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Tapa el agujero de abajo (donde el plato tocaba la mesa) con una base plana.
+    La malla viene parada (y hacia arriba, apoyada en y=0). La textura parte la malla en parches con vértices
+    repetidos, así que el borde real se busca uniendo vértices por posición."""
+    v, f = m.vertices, m.faces
+    alto = float(np.ptp(v[:, 1]))
+    if alto <= 0 or len(f) < 100:
+        return m
+    clave = np.round(v / (alto * 1e-5)).astype(np.int64)
+    _, uid = np.unique(clave, axis=0, return_inverse=True)
+    uid = uid.ravel()
+    fu = uid[f]
+    aristas = np.r_[fu[:, [0, 1]], fu[:, [1, 2]], fu[:, [2, 0]]]
+    orig = np.r_[f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]
+    orden = np.sort(aristas, axis=1)
+    _, inv, cuenta = np.unique(orden, axis=0, return_inverse=True, return_counts=True)
+    borde = cuenta[inv.ravel()] == 1
+    bajo = (v[orig[:, 0], 1] < alto * 0.15) & (v[orig[:, 1], 1] < alto * 0.15)
+    sel = orig[borde & bajo]
+    if len(sel) < 12:
+        return m
+    # color de la base: el promedio del borde de abajo, un poco más oscuro (como la sombra debajo del plato)
+    vis = m.visual
+    uv = getattr(vis, 'uv', None)
+    mat = getattr(vis, 'material', None)
+    img = (getattr(mat, 'baseColorTexture', None) or getattr(mat, 'image', None)) if mat is not None else None
+    if uv is None or img is None:
+        return m
+    img = img.convert('RGB')
+    w, h = img.size
+    a = np.asarray(img)
+    puv = uv[np.unique(sel.ravel())]
+    xs = np.clip(((puv[:, 0] % 1) * (w - 1)).astype(int), 0, w - 1)
+    ys = np.clip(((1 - puv[:, 1] % 1) * (h - 1)).astype(int), 0, h - 1)
+    color = np.clip(np.median(a[ys, xs].astype(np.float32), axis=0) * 0.8, 0, 255).astype(np.uint8)
+    lugar = _parche_libre(img, uv, f)
+    lado = 16
+    if lugar is None:  # sin esquina libre: se agrega una franja abajo de la textura
+        nueva = Image.new('RGB', (w, h + lado), tuple(int(c) for c in color))
+        nueva.paste(img, (0, 0))
+        uv = uv.copy(); uv[:, 1] = 1 - (1 - uv[:, 1]) * h / (h + lado)
+        img, h, lugar = nueva, h + lado, (0, h)
+    else:
+        img = img.copy(); img.paste(tuple(int(c) for c in color), (lugar[0], lugar[1], lugar[0] + lado, lugar[1] + lado))
+    uv_base = np.array([(lugar[0] + lado / 2) / w, 1 - (lugar[1] + lado / 2) / h])
+    # abanico desde el centro del borde, todo apoyado en y=0 (base plana)
+    centro = v[np.unique(sel.ravel())].mean(axis=0); centro[1] = 0.0
+    pa, pb = v[sel[:, 0]].copy(), v[sel[:, 1]].copy()
+    n0 = len(v)
+    k = len(sel)
+    nuevos_v = np.vstack([pa, pb, centro[None]])
+    caras = np.c_[n0 + k + np.arange(k), n0 + np.arange(k), np.full(k, n0 + 2 * k)]  # b, a, centro: mira hacia abajo
+    normal_y = np.cross(nuevos_v[k:2 * k] - centro, nuevos_v[:k] - centro)[:, 1]
+    al_reves = normal_y > 0
+    caras[al_reves] = caras[al_reves][:, [1, 0, 2]]
+    V = np.vstack([v, nuevos_v])
+    F = np.vstack([f, caras])
+    UV = np.vstack([uv, np.repeat(uv_base[None], len(nuevos_v), axis=0)])
+    mat2 = mat.copy() if hasattr(mat, 'copy') else mat
+    if hasattr(mat2, 'baseColorTexture'):
+        mat2.baseColorTexture = img
+    else:
+        mat2.image = img
+    out = trimesh.Trimesh(V, F, visual=trimesh.visual.TextureVisuals(uv=UV, material=mat2), process=False)
+    print(f'  base cerrada: {k} aristas del borde de abajo', file=sys.stderr)
+    return out
 
 
 def _medidas(m, escala):
